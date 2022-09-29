@@ -1,0 +1,650 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Figure preparation for paper
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "2-2.Summary_figures_for_paper"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+library(clustree)
+
+library(ComplexHeatmap)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(future)
+plan("multiprocess", workers = 4)
+# increase the allowed object size that can be transfered between master and workers
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+```{r}
+## File locations
+# Specify the location of input and output
+
+# Seurat object list with integrated samples subsequent doublet removal and cell cycle regression
+seurat_int <-
+  readRDS(here(
+    "output",
+    "1-3.Doublet_removal_CC_regres",
+    "seurat_indv_seurat_integrated_doublet_reoved_cc_regressed.rds"
+  ))
+
+# identified cell identities
+cluster_ids <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Cluster_identities_vs05-03-2021.xlsx"
+  ), sheet = 3) %>% 
+  mutate(cluster_id = str_remove(Cluster.Identities.0.4, "Cluster "))
+
+# Marker Genes for heatmap
+marker_genes <- openxlsx::read.xlsx(here(
+    "input_data",
+    "Cluster_identities_vs12-08-2020.xlsx"
+  ), sheet = 2) %>% 
+  rename("cell_type" = Midbrain.genes.for.heat.map, "symbol" = X2) %>% 
+  fill(cell_type, .direction = "down") %>% 
+  mutate(cell_type = str_remove(cell_type, " markers"))
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+```{r}
+cluster_ids <- cluster_ids %>%
+  mutate(
+    Colours_rgb = str_replace(Colours_rgb, "R", "rgb(red = ") %>%
+      str_replace(" G", ", green = ") %>%
+      str_replace("B", ", blue = ") %>%
+      str_c(", max = 255)", sep = ""),
+    Abbreviation = as_factor(Abbreviation) %>%
+      fct_relevel(
+        "mDA1",
+        "mDA2",
+        "mDA3",
+        "mDA4",
+        "mDA5",
+        "mDA6",
+        "mDA7",
+        "mDA8",
+        "NPCs1",
+        "NPCs2",
+        "NPCs3",
+        "NPCs4",
+        "NPCs5",
+        "N/A"
+      )
+  )
+```
+
+```{r}
+cluster_cols <- map_chr(cluster_ids$Colours_rgb, ~eval(parse(text = .x))) %>% 
+  set_names(cluster_ids$Abbreviation) 
+
+cluster_cols_num <- map_chr(cluster_ids$Colours_rgb, ~eval(parse(text = .x))) %>% 
+  set_names(cluster_ids$cluster_id) 
+```
+
+```{r}
+Idents(seurat_int) <- "integrated_snn_res.0.4"
+
+seurat_int <-
+  RenameIdents(seurat_int, (cluster_ids %>% {
+    structure(as.character(.$Abbreviation), names = .$cluster_id)
+  }))
+
+seurat_int[["cell_states.0.4"]] <- Idents(seurat_int)
+```
+
+# UMAPs with QC indicators
+```{r fig.height=15, fig.width=18, message=FALSE, warning=FALSE}
+ggarrange(
+  FeaturePlot(seurat_int,
+              features = "nFeature_RNA") +
+    labs(subtitle = "Number of detected features") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(plot.title = element_blank(),
+          text = element_text(family = "sans")),
+  
+  FeaturePlot(seurat_int,
+              features = "percent_mito") +
+    labs(subtitle = "Percentage of mitochondrial gene expression") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(plot.title = element_blank(),
+          text = element_text(family = "sans")),
+  
+  DimPlot(seurat_int, reduction = "umap", group.by = "Phase") +
+    labs(subtitle = "Cell Cycle Phase") +
+    scale_colour_discrete(name = "Cell cycle\nphase") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(text = element_text(family = "sans")),
+  
+  DimPlot(seurat_int, reduction = "umap", group.by = "orig.ident") +
+    labs(subtitle = "Sample mixing upon Integration (Replicate)") +
+    scale_colour_discrete(name = "Replicate") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(text = element_text(family = "sans")),
+  
+  DimPlot(seurat_int,
+          label = TRUE,
+          group.by = "doubletfinder.classification") +
+    NoLegend() +
+    labs(subtitle = "DoubletFinder suspected doublets") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(text = element_text(family = "sans")),
+  
+  DimPlot(seurat_int,
+          label = TRUE,
+          group.by = "doublet_cutoff_7000") +
+    NoLegend() +
+    labs(subtitle = "Doublets identified with\nmore than 7000 detected features") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(text = element_text(family = "sans")),
+  
+  align = "hv",
+  nrow = 3,
+  ncol = 2
+) %>%
+  annotate_figure(top = text_grob(
+    "iPSC-derived dopamine neurons",
+    face = "bold",
+    size = 16,
+    family = "sans"
+  ))
+```
+
+# UMAP with all clusters
+
+```{r}
+cluster_numbered <-  DimPlot(seurat_int,
+                             label = TRUE,
+                             group.by = "integrated_snn_res.0.4", 
+                         cols = cluster_cols_num, label.size = 5) +
+  NoLegend() +
+  labs(subtitle = "Identified cluster with resolution 0.4") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL) +
+  theme(text = element_text(family = "sans"))
+
+cluster_each <-  DimPlot(seurat_int,
+                         label = FALSE,
+                         group.by = "cell_states.0.4", 
+                         cols = cluster_cols,
+                         order = rev(c(
+        "mDA1",
+        "mDA2",
+        "mDA3",
+        "mDA4",
+        "mDA5",
+        "mDA6",
+        "mDA7",
+        "mDA8",
+        "NPCs1",
+        "NPCs2",
+        "NPCs3",
+        "NPCs4",
+        "NPCs5",
+        "N/A"
+      ))) +
+  # NoLegend() +
+  labs(subtitle = "Identified cell states") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL) +
+  theme(text = element_text(family = "sans"))
+```
+
+
+```{r fig.height=6, fig.width=12}
+ggarrange(cluster_numbered, cluster_each,# cluster_abr,cluster_abr_no_leg,
+  align = "hv",
+  nrow = 1,
+  ncol = 2
+) %>%
+  annotate_figure(top = text_grob(
+    "iPSC-derived dopamine neurons",
+    face = "bold",
+    size = 16,
+    family = "sans"
+  ))
+```
+
+
+```{r}
+ggsave(
+  plot = cluster_numbered,
+  filename = str_c(
+    figures_out,
+    "UMAP_plot_all_cells_Seurat_cluster_ID.png",
+    sep = "/"
+  ),
+  device = "png", width = 11, height = 7
+)
+
+ggsave(
+  plot = cluster_each,
+  filename = str_c(
+    figures_out,
+    "UMAP_plot_all_cells_Gurvir_Virdi_cluster_id_detailed.png",
+    sep = "/"
+  ),
+  device = "png", width = 11, height = 7
+)
+```
+
+```{r}
+ggsave(
+  plot = cluster_numbered,
+  filename = str_c(
+    figures_out,
+    "UMAP_plot_all_cells_Seurat_cluster_ID.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 11, height = 7
+)
+
+ggsave(
+  plot = cluster_each,
+  filename = str_c(
+    figures_out,
+    "UMAP_plot_all_cells_Gurvir_Virdi_cluster_id_detailed.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 11, height = 7
+)
+```
+
+```{r}
+ggsave(
+  plot =  DimPlot(
+    seurat_int,
+    label = TRUE,
+    group.by = "integrated_snn_res.0.4",
+    split.by = "orig.ident",
+    cols = cluster_cols_num,
+    label.size = 5
+  ) +
+    NoLegend() +
+    labs(subtitle = "Identified cluster with resolution 0.4") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(text = element_text(family = "sans")),
+  filename = str_c(
+    figures_out,
+    "UMAP_plot_all_cells_Seurat_cluster_ID_split_by_sample.png",
+    sep = "/"
+  ),
+  device = "png",
+  width = 18,
+  height = 7
+)
+```
+
+# Heatmap of genes of interest
+
+```{r fig.height=8}
+DefaultAssay(seurat_int) <- "RNA"
+seurat_int_scaled <- ScaleData(seurat_int, assay = "RNA")
+```
+
+```{r}
+seurat_int_list <- list(
+  "mDA" = subset(
+    seurat_int_scaled,
+    subset = cell_states.0.4 %in% (cluster_ids %>%
+                                     filter(str_detect(Abbreviation, "mDA")) %>%
+                                     pull(Abbreviation))
+  ),
+  "NPC" = subset(
+    seurat_int_scaled,
+    subset = cell_states.0.4 %in% (cluster_ids %>%
+                                     filter(str_detect(Abbreviation, "NPC")) %>%
+                                     pull(Abbreviation))
+  )
+)
+
+
+```
+
+```{r}
+col_max <- GetAssayData(seurat_int_scaled, slot = "scale.data", assay = "RNA") %>%
+  {
+    max(max(., na.rm = TRUE),
+        abs(min(.,
+                na.rm = TRUE)))
+  }
+
+colouring_fun <-
+  circlize::colorRamp2(c(-(col_max / 2), 0, (col_max / 2)), c("blue", "grey99", "red"))
+```
+
+```{r}
+marker_genes <- marker_genes %>% 
+  mutate(anno_colour = case_when(cell_type == "NPC" ~ "#000000",#"#ff0000",
+                                 cell_type == "Neuron" ~ "#000000"))
+```
+
+
+```{r, fig.height=6}
+hts <- map(seurat_int_list, function(seur_obj) {
+  # scaled RNA expression amtrix subset for the genes of interest
+  mat <-
+    GetAssayData(seur_obj, slot = "scale.data", assay = "RNA")
+  mat <- mat[marker_genes$symbol,]
+  col_anno <- seur_obj[[]] %>%
+    as_tibble(rownames = "cell_id") %>%
+    select(cell_id, cell_states.0.4) %>%
+    arrange(cell_states.0.4)
+  
+  # ensure that the column names of the expression matrix are in the same order as the cell state labelling
+  mat <- mat[, col_anno$cell_id]
+  
+  col_anno <-
+  columnAnnotation("cell_state" = col_anno$cell_states.0.4,
+                   col = list("cell_state" = cluster_cols))
+  
+  ht <- draw(
+  Heatmap(
+   mat,
+    name = "Scaled\nexpression",
+    col = colouring_fun,
+    show_column_names = FALSE,
+    cluster_columns = FALSE,
+    cluster_rows = TRUE,
+    row_names_gp = gpar(fontsize = 12, col = marker_genes$anno_colour),
+    top_annotation = col_anno
+  ),
+  merge_legend = TRUE
+)
+})
+```
+
+
+
+```{r}
+pdf(
+  file = str_c(
+    figures_out,
+    "heatmap_marker_genes_detailed_cell_id_labels_Gurvir_Virdi.pdf",
+    sep = "/"
+  )
+)
+hts
+dev.off()
+```
+
+```{r}
+png(
+  file = str_c(
+    figures_out,
+    "mDA_heatmap_marker_genes_detailed_cell_id_labels_Gurvir_Virdi.png",
+    sep = "/"
+  )
+)
+hts$mDA
+dev.off()
+```
+
+```{r}
+png(
+  file = str_c(
+    figures_out,
+    "NPC_heatmap_marker_genes_detailed_cell_id_labels_Gurvir_Virdi.png",
+    sep = "/"
+  )
+)
+hts$NPC
+dev.off()
+```
+
+
+```{r}
+tick_cols <- marker_genes %>% 
+{structure(.$anno_colour, names = .$symbol)}
+
+```
+
+
+```{r, fig.height=6, fig.width=6}
+(dotplot_mDA <- DotPlot(
+  subset(seurat_int,
+         subset = cell_states.0.4 %in% (
+           cluster_ids %>%
+             filter(str_detect(Abbreviation, "mDA")) %>%
+             pull(Abbreviation)
+         )),
+  features = names(tick_cols),
+  col.min = 0
+) +
+  theme(axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x = element_text(
+    angle = 90,
+    hjust = 1,
+    vjust = 0.5),
+  axis.text.y = element_text(
+    colour = rev(tick_cols)
+  )) +
+  coord_flip())
+```
+
+```{r, fig.height=6, fig.width=6}
+(dotplot_NPC <- DotPlot(
+  subset(seurat_int,
+         subset = cell_states.0.4 %in% (
+           cluster_ids %>%
+             filter(str_detect(Abbreviation, "NPC")) %>%
+             pull(Abbreviation)
+         )),
+  features = names(tick_cols),
+  col.min = 0
+) +
+  theme(axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x = element_text(
+    angle = 90,
+    hjust = 1,
+    vjust = 0.5),
+  axis.text.y = element_text(
+    colour = rev(tick_cols)
+  )) +
+  coord_flip())
+```
+
+
+
+```{r}
+ggsave(
+  plot = dotplot_mDA,
+  filename = str_c(
+    figures_out,
+    "dotplot_mDA_Seurat_cluster_ID.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 7, height = 7
+)
+
+ggsave(
+  plot = dotplot_NPC,
+  filename = str_c(
+    figures_out,
+    "dotplot_NPCs_Seurat_cluster_ID.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 7, height = 7
+)
+```
+
+
+```{r}
+DefaultAssay(seurat_int) <- "RNA"
+(SNCA_feat_plot <- FeaturePlot(
+  seurat_int,
+  features = "SNCA",
+  # split.by = "condition",
+  label = FALSE,
+  combine = TRUE,
+  coord.fixed = TRUE,
+  by.col = TRUE
+) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL))
+
+(SNCA_feat_plot_label <- FeaturePlot(
+  seurat_int,
+  features = "SNCA",
+  # split.by = "condition",
+  label = TRUE,
+  combine = TRUE,
+  coord.fixed = TRUE,
+  by.col = TRUE
+) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL))
+```
+
+```{r}
+ggsave(
+  plot = SNCA_feat_plot,
+  filename = str_c(
+    figures_out,
+    "SNCA_featureplot_Seurat.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 7, height = 7
+)
+
+ggsave(
+  plot = SNCA_feat_plot_label,
+  filename = str_c(
+    figures_out,
+    "SNCA_featureplot_with_labels_Seurat.pdf",
+    sep = "/"
+  ),
+  device = "pdf", width = 7, height = 7
+)
+```
+
+```{r, fig.height=6}
+seur_all <- list("all" = subset(seurat_int_scaled,
+                                subset = cell_states.0.4 != ("N/A")))
+hts_all <-
+  map(seur_all, function(seur_obj) {
+    # scaled RNA expression matrix subset for the genes of interest
+    mat <-
+      GetAssayData(seur_obj, slot = "scale.data", assay = "RNA")
+    mat <- mat[marker_genes$symbol,]
+    col_anno <- seur_obj[[]] %>%
+      as_tibble(rownames = "cell_id") %>%
+      select(cell_id, cell_states.0.4) %>%
+      mutate(
+        cell_states.0.4 = fct_drop(cell_states.0.4) %>%
+          fct_relevel(
+            "FB NPC",
+            "RM NPCs",
+            "NPCs1",
+            "NPCs2",
+            "NPCs3",
+            "FB/mDA",
+            "mDA1",
+            "mDA2",
+            "mDA3",
+            "mDA4",
+            "mDA5",
+            "mDA6",
+            "mDA7"
+          )
+      ) %>%
+      arrange(cell_states.0.4)
+    
+    cluster_cols <- cluster_cols[levels(col_anno$cell_states.0.4)]
+    # ensure that the column names of the expression matrix are in the same order as the cell state labelling
+    mat <- mat[, col_anno$cell_id]
+    
+    col_anno <-
+      columnAnnotation(
+        "cell_state" = col_anno$cell_states.0.4,
+        col = list("cell_state" = cluster_cols)
+      )
+    
+    ht <- draw(
+      Heatmap(
+        mat,
+        name = "Scaled\nexpression",
+        col = colouring_fun,
+        show_column_names = FALSE,
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        row_names_gp = gpar(fontsize = 12, col = marker_genes$anno_colour),
+        top_annotation = col_anno
+      ),
+      merge_legend = TRUE
+    )
+  })
+```
+
+```{r}
+png(
+  file = str_c(
+    figures_out,
+    "all_heatmap_marker_genes_detailed_cell_id_labels_Gurvir_Virdi.png",
+    sep = "/"
+  )
+)
+hts_all
+dev.off()
+```
+
+
+```{r}
+saveRDS(seurat_int, file = str_c(output, "seurat_indv_seurat_integrated_doublet_reoved_cc_regressed.rds", sep = "/"))
+```
+

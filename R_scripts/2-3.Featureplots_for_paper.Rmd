@@ -1,0 +1,164 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Featureplots for paper
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "2-3.Featureplots_for_paper"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+library(clustree)
+
+library(ComplexHeatmap)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(future)
+plan("multiprocess", workers = 4)
+# increase the allowed object size that can be transfered between master and workers
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+```{r}
+## File locations
+# Specify the location of input and output
+
+# Seurat object list with integrated samples subsequent doublet removal and cell cycle regression
+seurat_int <-
+  readRDS(here(
+    "output",
+    "1-4.Doublet_removal_CC_regres",
+    "seurat_indv_seurat_integrated_doublet_reoved_cc_regressed.rds"
+  ))
+
+# Identified cell identities
+cluster_ids <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Cluster_identities_vs05-03-2021.xlsx"
+  ), sheet = 3) %>% 
+  mutate(cluster_id = str_remove(Cluster.Identities.0.4, "Cluster "))
+
+# Genes for visualisation as featureplots
+marker_genes <- c("TH", "CALB1", "KCNJ6", "FOXA2", "LMX1A", "LMX1B", "OTX2", "MAP2", "SYT1")
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+```{r}
+cluster_ids <- cluster_ids %>%
+  mutate(
+    Colours_rgb = str_replace(Colours_rgb, "R", "rgb(red = ") %>%
+      str_replace(" G", ", green = ") %>%
+      str_replace("B", ", blue = ") %>%
+      str_c(", max = 255)", sep = ""),
+    Abbreviation = as_factor(Abbreviation) %>%
+      fct_relevel(
+        "mDA1",
+        "mDA2",
+        "mDA3",
+        "mDA4",
+        "mDA5",
+        "mDA6",
+        "mDA7",
+        "mDA8",
+        "NPCs1",
+        "NPCs2",
+        "NPCs3",
+        "NPCs4",
+        "NPCs5",
+        "N/A"
+      )
+  )
+```
+
+```{r}
+cluster_cols <- map_chr(cluster_ids$Colours_rgb, ~eval(parse(text = .x))) %>% 
+  set_names(cluster_ids$Abbreviation) 
+
+cluster_cols_num <- map_chr(cluster_ids$Colours_rgb, ~eval(parse(text = .x))) %>% 
+  set_names(cluster_ids$cluster_id) 
+```
+
+```{r}
+Idents(seurat_int) <- "integrated_snn_res.0.4"
+
+seurat_int <-
+  RenameIdents(seurat_int, (cluster_ids %>% {
+    structure(as.character(.$Abbreviation), names = .$cluster_id)
+  }))
+
+seurat_int[["cell_states.0.4"]] <- Idents(seurat_int)
+```
+
+
+```{r}
+map(marker_genes, function(gene_id) {
+  feat_plot = FeaturePlot(seurat_int,
+              features = gene_id) +
+    labs(subtitle = gene_id) +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL) +
+    theme(plot.title = element_blank(),
+          text = element_text(family = "sans"))
+  
+  ggsave(plot = feat_plot, path = figures_out, filename = str_c("FeaturePlot_for_", gene_id, ".pdf", sep = ""))
+  feat_plot
+})
+```
+
+```{r}
+map_df(marker_genes, function(gene_id) {
+  tibble(
+    "gene_id" = gene_id,
+    "percent_cells_expr" = round(sum(
+      GetAssayData(object = seurat_int, slot = "data")[gene_id,] > 0
+    ) / length(Cells(seurat_int)) * 100, digits = 2)
+  )
+}) %>%
+  arrange(percent_cells_expr) %>% 
+  openxlsx::write.xlsx(
+    overwrite = TRUE,
+    file = str_c(
+      figures_out,
+      "Percentage_of_genes_expression_gene_of_interest_above_zero.xlsx",
+      sep = "/"
+    )
+  )
+```
+
+

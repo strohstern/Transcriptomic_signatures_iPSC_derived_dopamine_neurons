@@ -1,0 +1,871 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: QC and integration across biological replicates
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "2-1.Summary_of_analysis"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+library(clustree)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(future)
+plan("multiprocess", workers = 4)
+# increase the allowed object size that can be transfered between master and workers
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+
+
+```{r}
+## File locations
+# Specify the location of input and output
+raw_plots <-
+  readRDS(
+    here(
+      "output",
+      "0-3.Initial_QC_filter_out_cluster",
+      "Plots_illustrating_filtering_raw_data.rds"
+    )
+  )
+
+# Seurat object list with individual samples
+seurat_indv <- readRDS(
+  here(
+    "output",
+    "0-4.label_suspected_doublets",
+    "Seurat_individual_sample_pre-processed_doublets_labelled.rds"
+  )
+)
+
+# Seurat object list with integrated samples
+seurat_int <-
+  here(
+    "output",
+    "1-2.Clustering_of_integratated_dataset",
+    "Seurat_obj_int_seurat_filtered_integrated_pre-processed.rds"
+  )
+
+# Seurat object list with integrated samples subsequent doublet removal and cell cycle regression
+seurat_int_reg <-
+  here(
+    "output",
+    "1-3.Doublet_removal_CC_regres",
+    "seurat_indv_seurat_integrated_doublet_reoved_cc_regressed.rds"
+  )
+
+# Marker gene list provided 
+marker_gene_list <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Midbrain_dopaminergic_neurons_marker_genes.xlsx"
+  ),
+  sheet = 2) %>%
+  mutate(symbol = str_to_upper(symbol) %>%
+           str_trim()) %>%
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map(
+    .,
+    ~ .x$cell_type %>% unique() %>%
+      str_replace_all(" ", "_") %>%
+      str_replace_all("/", "_")
+  ))
+
+# Addendum: adding identified cell identities
+cluster_ids <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Cluster_identities_vs29-07-2020.xlsx"
+  )) %>%
+  separate(X2,
+           into = c("cell_type", "identity_genes"),
+           sep = " \\(") %>% 
+  mutate(Cluster.Identities = str_remove(Cluster.Identities, "Cluster ") %>% 
+           str_trim())
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+
+```
+
+# Project description
+
+We have developed a new method to generate midbrain dopaminergic neurons from iPSCs, and aim to characterise the cell clusters and identity markers using the new protocol to derive dopaminergic neurons, using single cell RNA seq.
+
+
+**Experimental Approach**:  
+Please include details such as the number of biological and / or technical replicates:
+
+For the single cell RNAseq experiment, we are testing whether the protocol generates midbrain dopamine neurons, and what other cell types are in the culture. We will use 3 control (3 biological replicates) and 3 mutant lines (3 biological replicates) to determine that disease and control individuals generate the same cells in culture. This will also provide markers for the cell types that can then be used to deconvolve the bulk sequencing data.
+
+## Available Samples
+
+The data set contains 3 samples: biological replicates of control (i.e. healthy patient) iPSC lines differentiated in vitro into midbrain dopaminergic cells.
+
+## Bioinformatics analysis strategy
+
+The QC report provided by CellRanger was surveyed for each sample (i.e. each library preparation independently).
+
+The analysis was carried out using [Seurat v3.1.0](https://satijalab.org/seurat/). Initially we removed all cells with less than 200 detected features and performed the standard analysis pipeline as described in this [vignette](https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html) with default settings at each step. 
+From each library we removed cluster with an average percentage of mitochondrial gene expression above 7.5% and concomittantly with an average number of detected features across the cluster below 1300.
+
+Suspected doublets were labelled using a hard cut-off of more than 7000 features per "cell" and with [DoubletFinder](https://www.sciencedirect.com/science/article/pii/S2405471219300730).
+
+After each sample (at the library level) was filtered to remove low quality cells, the 3 samples were integrated using the standard workflow in Seurat v3.1.
+
+After a first-pass analysis a cluster containing mostly suspected doublets was removed and the cell cycle signal was fully regressed out as described in this [Seurat vignette](https://satijalab.org/seurat/v3.1/cell_cycle_vignette.html) using the cell cycle scoring strategy described in [Tirosh et al. 2016](https://science.sciencemag.org/content/352/6282/189).
+
+# Results
+
+## CellRanger QC
+
+The CellRanger QC results did not highlight any considerable problems. It is worth noting though that the number of detected cells is considerably smaller (between ~1000-1400) than the number of predicted cells (~3900). In addition, the fraction of reads is around ~70% which may indicate to background ambient RNA (Testing ambient RNA removal procedures may improve signal?).
+
+```{r}
+full_join(
+  purrr::map_dfr(seurat_indv, function(seurat_obj) {
+    seurat_obj[[]] %>%
+      pull(pred_nb_cells_captured) %>%
+      unique()
+  }) %>%
+    gather(sample_id, predicted_nb_cells),
+  
+  purrr::map_dfr(seurat_indv, function(seurat_obj) {
+    ncol(seurat_obj)
+  }) %>%
+    gather(sample_id, nb_cells_captured),
+  by = "sample_id"
+)
+```
+
+## QC on indicidual samples
+
+To inform the decision of cut-off for the percentage of mitochondrial gene expression and the number of detected features to identify low quality cells, we investigated the distribution of these two after removing cells with less than 200 detectable features.
+```{r, fig.height=6, fig.width=8}
+ggarrange(raw_plots$raw_mito,
+          raw_plots$raw_feature,
+          common.legend = TRUE,
+          legend = "right",
+          ncol = 1, nrow = 2) %>% 
+  annotate_figure(bottom = text_grob("Distributions across all cells with at least 200 detected features.", size = 10))
+```
+```{r}
+raw_plots$raw_mito$labels$title <- "Percentage of expressed mitochondrial genes"
+ggsave(raw_plots$raw_mito, filename = str_c(figures_out, "raw_mito_plot.png", sep = "/"), height = 3, width = 6)
+```
+
+```{r}
+raw_plots$raw_feature$title <- "Number of expressed features"
+ggsave(raw_plots$raw_feature, filename = str_c(figures_out, "raw_feature_plot.png", sep = "/"), height = 3, width = 6)
+```
+
+The percentage of mitochondrial expression distribution is very similar across all the samples with most of the cells showing less than ~7.5% mitochondrial gene expression.
+The number of detected features is also similar across all samples with the majority of cells having between ~1300 and ~6000 detectable features. In all samples a sizable fraction of cells were detected with less than 1300 detected features. 
+
+Based on the above observations we identfied low quality cell cluster as those cluster that on average across the cluster, expressed more than 7.5% mitochondrial genes and, in addition, showed less than 1300 detected features. In all samples a cluster of low quality cells is removed.
+```{r, fig.height=12, fig.width=18}
+raw_plots$cluster_filtered
+```
+
+Apart from filtering bad quality cells, the detection of doublets needs to be considered, especially when performing trajectory analysis. Here, we labelled all cells with more than 7000 detected features as doublets. Furthermore, the usage of tools such as [DoubletFinder](https://www.sciencedirect.com/science/article/abs/pii/S2405471219300730) enabled the labelling of doublets in a more systematic way.
+
+```{r fig.height=12, fig.width=18, message=FALSE, warning=FALSE}
+purrr::imap(seurat_indv, function(seurat_obj, seur_name) {
+  sub_text <- seurat_obj@project.name %>%
+    str_replace("_|\\.", " ") 
+  
+  ggarrange(
+ DimPlot(seurat_obj, label = TRUE, group.by = "doublet_cutoff_7000") +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with cut-off\n(number of features > 7000") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(seurat_obj, label = TRUE, group.by = colnames(seurat_obj[[]])[str_detect(colnames(seurat_obj[[]]), "^DF")]) +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with DoubletFinder") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(seurat_obj, label = TRUE, group.by = "RNA_snn_res.1") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 1") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(seurat_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+    annotate_figure(top = text_grob(sub_text,
+                                    face = "bold",
+                                    size = 12))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_indv),
+    ncol = 1,
+    align = "hv"
+  ) %>%
+  annotate_figure(
+    top = text_grob(
+      "Filtering cells in clusters with high mitochodrial expression and low number of detected features",
+      face = "bold",
+      size = 16
+    )
+  )
+```
+
+The doublets identified with both methods seem to locate to specific cluster in A1 and A3, and, to a lesser extent, in sample A2. In addition, cell cycle phase appears to be a major factor that seems to drive clustering. Cell cycle phase can overlap with specific cell states, especially in developmental and differentiation processes.
+```{r}
+rm(seurat_indv, raw_plots)
+```
+
+
+# Integration across all samples
+
+After integration using the standard approach in Seurat v3 described in this [vignette](https://satijalab.org/seurat/v3.1/integration.html), we performed the dimension reduction using the first 45 PCAs. (The number of PCAs used was estimated based on the Elbow plots and Jack-Straw plots. The number of PCAs used could be potentially further informed by biological information.)
+
+```{r}
+seurat_int <- readRDS(seurat_int)
+```
+
+
+```{r}
+seurat_int <- map(seurat_int, function(seurat_obj) {
+  seurat_obj$doubletfinder.classification <- seurat_obj[[]] %>%
+    as_tibble(rownames = "cell_id") %>%
+    select(cell_id, starts_with("DF")) %>%
+    gather(DF_id, DF.classification,-cell_id) %>%
+    group_by(cell_id) %>%
+    filter(!is.na(DF.classification)) %>% 
+    pull(DF.classification)
+  seurat_obj
+})
+```
+
+After integration of the 3 biological replicates, we observe good admixture of the samples, however the separation of cells in the three cell cycle phases is still observable.
+
+```{r fig.height=5, fig.width=18, message=FALSE, warning=FALSE}
+imap(seurat_int, function(seurat_obj, seur_name) {
+  sub_text <- seur_name
+  
+  ggarrange(
+    
+    DimPlot(seurat_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(seurat_obj, reduction = "umap", group.by = "orig.ident") +
+      labs(subtitle = "Sample mixing upon Integration (Replicate)") +
+      scale_colour_discrete(name = "Replicate") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 2
+  ) 
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_int),
+    ncol = 1,
+    align = "hv"
+  )
+```
+
+```{r}
+seurat_int <- map(seurat_int , function(seurat_obj){
+  Idents(seurat_obj) <- "integrated_snn_res.0.4"
+  seurat_obj
+  })
+```
+
+```{r message=FALSE, warning=FALSE, fig.height=8}
+ggarrange(
+  DimPlot(seurat_int$integrated, label = TRUE, group.by = "integrated_snn_res.1.4") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 1.4") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+  FeaturePlot(seurat_int$integrated,
+            features = "nFeature_RNA") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+  DimPlot(seurat_int$integrated,
+        label = TRUE,
+        group.by = "doubletfinder.classification") +
+  NoLegend() +
+  labs(subtitle = "DoubletFinder suspected doublets") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL),
+
+DimPlot(seurat_int$integrated,
+        label = TRUE,
+        group.by = "doublet_cutoff_7000") +
+  NoLegend() +
+  labs(subtitle = "Doublets identified with\nmore than 7000 detected features") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL),
+# align = "hv",
+nrow = 2,
+ncol = 2)
+```
+Cluster 11 (resolution 1.4) seems to primarily consist of predicted doublets. This coincides with a high number of detected features and the cells the being in the G2M cell cycle phase.
+
+As one of the identified clusters seemed to primarily consist of doublets, this cluster was removed for the subsequent analysis. Similarly, as cell cycle seemed to drive clustering, at least in part, the cell cycle signal was regressed out.
+
+```{r}
+ggsave(plot = DimPlot(seurat_int$integrated,
+        label = FALSE,
+        group.by = "doubletfinder.classification") +
+  labs(subtitle = "Identification of suspected doublets with DoubletFinder") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL),
+  filename = str_c(
+    figures_out,
+    "Integrated_all_doublets.png",
+    sep = "/"
+  ),
+  device = "png",
+  width = 8,
+  height = 4)
+```
+
+```{r}
+ggsave(
+  plot =  DimPlot(
+    seurat_int$integrated,
+    reduction = "umap",
+    group.by = "Phase"
+  ) +
+    labs(subtitle = "Cell Cycle Phase") +
+    scale_colour_discrete(name = "Cell cycle\nphase") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL),
+  filename = str_c(figures_out,
+                   "Integrated_all_cell_cycle.png",
+                   sep = "/"),
+  device = "png",
+  width = 8,
+  height = 4
+)
+```
+
+# Samples after doublet removal and cell cycle regression
+
+After removal of doublets and cell cycle regression, we performed the dimension reduction using the first 50 PCAs. (The number of PCAs used was estimated based on the Elbow plots and Jack-Straw plots. The number of PCAs used could be potentially further informed by biological information.)
+
+```{r}
+seurat_int_reg <- readRDS(seurat_int_reg)
+seurat_int_reg <- list("integrated" = seurat_int_reg)
+rm(seurat_int)
+```
+
+
+```{r fig.height=5, fig.width=18, message=FALSE, warning=FALSE}
+imap(seurat_int_reg, function(seurat_obj, seur_name) {
+  sub_text <- seur_name
+  
+  ggarrange(
+    
+    DimPlot(seurat_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(seurat_obj, reduction = "umap", group.by = "orig.ident") +
+      labs(subtitle = "Sample mixing upon Integration (Replicate)") +
+      scale_colour_discrete(name = "Replicate") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 2
+  )
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_int_reg),
+    ncol = 1,
+    align = "hv"
+  )
+```
+Even after cell cycle regression the separation of cells according to the cell cycle persists. This is likely due to other factors correlating with cell cycle that drive the separation that is still visible even after the cell cycle signal was regressed out. Note that the cell cycle signal was calculated based on the following cell cycle genes described in  [Tirosh et al. 2016](https://science.sciencemag.org/content/352/6282/189):
+
+```{r}
+ggsave(
+  plot =  DimPlot(
+    seurat_int_reg$integrated,
+    reduction = "umap",
+    group.by = "Phase"
+  ) +
+    labs(subtitle = "Cell Cycle Phase") +
+    scale_colour_discrete(name = "Cell cycle\nphase") +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL),
+  filename = str_c(figures_out,
+                   "Integrated_all_cell_cycle_regressed.png",
+                   sep = "/"),
+  device = "png",
+  width = 6,
+  height = 4
+)
+```
+
+```{r}
+c(cc.genes$s.genes, cc.genes$g2m.genes)
+```
+
+```{r}
+seurat_int_reg <- map(seurat_int_reg , function(seurat_obj){
+  Idents(seurat_obj) <- "integrated_snn_res.0.4"
+  seurat_obj
+  })
+```
+
+```{r message=FALSE, warning=FALSE, fig.height=8}
+ggarrange(
+  DimPlot(seurat_int_reg$integrated, label = TRUE, group.by = "integrated_snn_res.0.4") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 0.4") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+  FeaturePlot(seurat_int_reg$integrated,
+            features = "nFeature_RNA") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+  DimPlot(seurat_int_reg$integrated,
+        label = TRUE,
+        group.by = "doubletfinder.classification") +
+  NoLegend() +
+  labs(subtitle = "DoubletFinder suspected doublets") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL),
+
+DimPlot(seurat_int_reg$integrated,
+        label = TRUE,
+        group.by = "doublet_cutoff_7000") +
+  NoLegend() +
+  labs(subtitle = "Doublets identified with\nmore than 7000 detected features") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL),
+# align = "hv",
+nrow = 2,
+ncol = 2)
+```
+The removal of the cluster with mainly doublets, removed the majority of suspected doublets from the dataset.
+
+Before we investigate one (or more) particular cluster resolution(s) to specify cell identities we further investigate the effect of different cluster resolutions.
+We visualise the relationships between a range of clustering resolutions using the R package [`clustree`](https://cran.r-project.org/web/packages/clustree/vignettes/clustree.html). In the tree graph each cluster forms a node in the tree and edges are constructed by considering the cells in a cluster at a lower resolution that end up in a cluster at the next highest resolution. Using this visualisation we can see which clusters are related to each other, are clearly distinct or are unstable.
+
+```{r}
+cluster_analysis <- imap(seurat_int_reg, function(seurat_obj, seur_name) {
+  clustree(seurat_obj, prefix = "integrated_snn_res.") +
+    ggtitle(str_c("Changes in clustering resolution", sep = " "))
+})
+```
+
+```{r, fig.height=8}
+cluster_analysis$integrated
+```
+The identified clusters are extremely stable across all tested clustering resolutions. Of the 14 clusters identified at resolution 0.4, only two exchange cells at higher clustering resolutions. Five clusters are extremely stable, i.e. clusters 7, 10, 11, 12 do not split into subcluster 13, while clusters 1, 2, 3, 4, 5, 6, 8 and 9 split into at most two subcluster.
+Wetherefore analysed the clustering at the lowest (0.4) and highest (1.8) tested clustering resolution.
+
+```{r}
+ggsave(
+  plot = cluster_analysis$integrated,
+  filename = str_c(figures_out,
+                   "Integrated_all_clustree.png",
+                   sep = "/"),
+  device = "png",
+  width = 7,
+  height = 8
+)
+```
+
+
+When visualising the UMAP plots for each of the samples individually, we can observe that all clusters contain cells from each of the biological replicates as would be expected.
+
+```{r, fig.width=12, fig.height=4}
+DimPlot(seurat_int_reg$integrated,
+        label = TRUE,
+        group.by = "integrated_snn_res.0.4",
+        split.by = "orig.ident") +
+  NoLegend() +
+  labs(subtitle = "Cluster across replicates with a resolution of 0.4") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL)
+```
+
+## Known marker gene expression
+
+When investigating the provided marker genes, it is noteworthy that CHAT (marker for cholinergic neurons) was not detectable at all in this dataset.
+
+```{r}
+marker_gene_list$Cholinergic <- NULL
+```
+
+In addition, the following marker genes were not detectable:
+
+* HOXA2, HOXA1, HOXA3, HOXA5 (hindbrain markers)
+    + these markers would not be expected
+* SLC6A3 (Dopamine transporter), PITX3 (mature midbrain neuron marker)
+    + expected to be detectable in the dataset
+* WNT1 (midbrain precursor marker)
+    + expected to be detectable in the dataset
+
+```{r fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+imap(seurat_int_reg, function(seurat_obj, seur_name) {
+    DefaultAssay(seurat_obj) <- "RNA"
+    sub_text <- "Replicate integrated, clustering resolution 0.4" 
+    
+    feats <- marker_gene_list %>% map(~ .x %>% pull(symbol)) %>% unlist()
+    
+    # gene_list
+    DotPlot(seurat_obj,
+            features = feats,
+            col.min = 0) +
+      ggtitle(sub_text) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(
+          angle = 90,
+          hjust = 1,
+          vjust = 0.5
+        )
+      ) 
+  })
+```
+Some of the clusters identified represent  midbrian neural precursors/ neurons, e.g. cluster 12 and cluster 13. Two cluster (resolution 0.4) express the dopaminergic neuron marker TH (clusters 1, 7), while cluster 12 (potentially also cluster 11) contains dopamin-producing neurons.
+The expression of the pluripotency markers POU5F1 and NANOG is detectable only in very few cells, generally at a very low expression level indicating that the majority of cells represent more differentiated cell states. SOX2 which is also expressed in neural stem/progenitor cells is detected across many clusters, while PAX6, which is also a pan-neural early NPC marker is detectable in cluster 10.
+Cluster 13 likely contains some Glutamatergic neurons, while cluster 10 likely contains some GABAergic neurons.
+
+For the cluster which split into subcluster, we investigate the expression of the selected marker at the higher clustering resolution of 1.8.
+```{r fig.height=7, fig.width=10, message=FALSE, warning=FALSE}
+imap(seurat_int_reg, function(seurat_obj, seur_name) {
+    DefaultAssay(seurat_obj) <- "RNA"
+    Idents(seurat_obj) <- "integrated_snn_res.1.8"
+    sub_text <- "Replicate integrated, clustering resolution 1.8" 
+    
+    feats <- marker_gene_list %>% map(~ .x %>% pull(symbol)) %>% unlist()
+    
+    # gene_list
+    DotPlot(seurat_obj,
+            features = feats,
+            col.min = 0) +
+      ggtitle(sub_text) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(
+          angle = 90,
+          hjust = 1,
+          vjust = 0.5
+        )
+      ) 
+  })
+```
+
+
+## Find marker genes for each of the cluster
+
+```{r, eval=TRUE}
+cluster_marker <-
+  readRDS(file = str_c(
+    output,
+    "seurat_indv_seurat_markergenes_integrated.rds",
+    sep = "/"
+  ))
+
+cluster_marker_04 <- cluster_marker$marker_genes_res_04
+cluster_marker_18 <- cluster_marker$marker_genes_res_18
+```
+
+Initially we will identify the marker genes for the cluster identified with a clustering resolution of 0.4.
+
+We identified markers for each of the cell clusters to aid the identification of each of the clusters. Here we find positive markers for each cluster in comparison to all remaining cells. The features have to be detected at a minimum percentage of 25% in either of the two groups of cells, with limiting testing further to genes which show, on average, at least 0.25-fold difference (log-scale) between the two groups of cells.
+```{r message=FALSE, warning=FALSE, eval=FALSE, include=FALSE}
+cluster_marker_04 <- map(seurat_int_reg, function(seurat_obj) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  cluster_marker <-
+    FindAllMarkers(
+      seurat_obj,
+      only.pos = TRUE,
+      min.pct = 0.25,
+      logfc.threshold = 0.25
+    )
+  DefaultAssay(seurat_obj) <- "integrated"
+  cluster_marker
+})
+
+```
+
+The top 10 positive marker genes for each cluster are as follows:
+```{r}
+cluster_marker_04_sum <- map(cluster_marker_04, function(clust_mark){
+  clust_mark %>% 
+    group_by(cluster) %>% 
+    top_n(n = 10, wt = avg_logFC) %>% 
+    select(-p_val)
+})
+```
+
+```{r}
+cluster_marker_04_sum$integrated %>% DT::datatable(caption = "Top 10 marker genes for mouse cluster at resolution 0.4")
+```
+
+The full information about marker genes for each cluster can be found in the accompanying excel file `FindAllMarker_integrated_clusteringResolution0.4.xlsx`.
+
+```{r, fig.height=6}
+DimPlot(
+  seurat_int_reg$integrated,
+  label = TRUE,
+  group.by = "integrated_snn_res.0.4",
+  ncol = 3
+) +
+  # NoLegend() +
+  labs(subtitle = "Cluster with a resolution of 0.4") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL)
+```
+
+
+Subsequently, we will identify the marker genes for the cluster identified with a clustering resolution of 1.8.
+```{r}
+seurat_int_reg <- map(seurat_int_reg , function(seurat_obj){
+  Idents(seurat_obj) <- "integrated_snn_res.1.8"
+  seurat_obj
+  })
+```
+We identified markers for each of the cell clusters to aid the identification of each of the clusters. Here we find positive markers for each cluster in comparison to all remaining cells. The features have to be detected at a minimum percentage of 25% in either of the two groups of cells, with limiting testing further to genes which show, on average, at least 0.25-fold difference (log-scale) between the two groups of cells.
+```{r message=FALSE, warning=FALSE, eval=FALSE, include=FALSE}
+cluster_marker_18 <- map(seurat_int_reg, function(seurat_obj) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  cluster_marker <-
+    FindAllMarkers(
+      seurat_obj,
+      only.pos = TRUE,
+      min.pct = 0.25,
+      logfc.threshold = 0.25
+    )
+  DefaultAssay(seurat_obj) <- "integrated"
+  cluster_marker
+})
+
+```
+
+The top 10 positive marker genes for each cluster are as follows:
+```{r}
+cluster_marker_18_sum <- map(cluster_marker_18, function(clust_mark){
+  clust_mark %>% 
+    group_by(cluster) %>% 
+    top_n(n = 10, wt = avg_logFC) %>% 
+    select(-p_val)
+})
+```
+
+```{r}
+cluster_marker_18_sum$integrated %>% DT::datatable(caption = "Top 10 marker genes for mouse cluster at resolution 1.4")
+```
+
+The full information about marker genes for each cluster can be found in the accompanying excel file `FindAllMarker_integrated_clusteringResolution1.8.xlsx`.
+
+```{r, fig.height=6}
+DimPlot(
+  seurat_int_reg$integrated,
+  label = TRUE,
+  group.by = "integrated_snn_res.1.8",
+  ncol = 3
+) +
+  # NoLegend() +
+  labs(subtitle = "Cluster with a resolution of 1.8") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL)
+```
+
+Some marker genes have been used previously for experimental validation in immunostaining and/or qRT-PCR. We visualised their expression across the dataset.
+Note that SLC6A3 is not detectable in this dataset.
+```{r fig.height=26, fig.width=10, message=FALSE, warning=FALSE}
+# Finally, we can survey the expression of the marker genes using `FeaturePlots`
+
+exp_genes <- c(
+  "GABRA1",
+  "GRIA3",
+  "TH",
+  "DDC",
+  "FOXA2",
+  "LMX1A",
+  "EN1",
+  "NR4A2",
+  # "SLC6A3",
+  "KCNJ6", # "GIRK2",
+  "SNCA",
+  "GAPDH",
+  "OTX2",
+  "TUBB3",
+  "MAP2",
+  "TOMM20",
+  "MAP1LC3B"
+)
+imap(seurat_int_reg, function(seurat_obj, seur_name) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  map(exp_genes, function(gene_id) {
+    FeaturePlot(
+      seurat_obj,
+      features = gene_id,
+      # split.by = "condition",
+      combine = TRUE,
+      coord.fixed = TRUE,
+      by.col = TRUE
+    ) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL)
+  }) %>%
+    ggarrange(plotlist = .,
+              ncol = 2,
+              nrow = ceiling(length(exp_genes) / 2))
+})
+```
+
+# Cell state identification
+
+Gurvir Virdi identified the cell states for all the clusters at a clustering resolution of 0.4 using prior knowledge about the selected marker genes.
+
+```{r}
+Idents(seurat_int_reg$integrated) <- "integrated_snn_res.0.4"
+
+seurat_int_reg$integrated <-
+  RenameIdents(seurat_int_reg$integrated, (cluster_ids %>% {
+    structure(.$cell_type, names = .$Cluster.Identities)
+  }))
+
+seurat_int_reg$integrated [["cell_states.0.4"]] <- Idents(seurat_int_reg$integrated )
+```
+
+```{r, fig.height=6}
+DimPlot(
+  seurat_int_reg$integrated,
+  label = FALSE,
+  group.by = "cell_states.0.4",
+  ncol = 3
+) +
+  # NoLegend() +
+  labs(subtitle = "Cell states identified at a resolution of 0.4") +
+  coord_fixed(ratio = 1) +
+  scale_x_discrete(breaks = NULL) +
+  scale_y_discrete(breaks = NULL)
+```
+
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+imap(
+  cluster_marker_04,
+  ~ .x %>%
+    group_by(cluster) %>%
+    group_split() %>% 
+    set_names(str_c(.y, "res0.4","cluster", map(., ~ .x %>% 
+           pull(cluster) %>% 
+           unique() %>% 
+           as.character()), sep = "_"))
+) %>% 
+  flatten() %>% 
+  openxlsx::write.xlsx(file = str_c(output, "FindAllMarker_integrated_clusteringResolution0.4.xlsx", sep = "/"))
+
+imap(
+  cluster_marker_18,
+  ~ .x %>%
+    group_by(cluster) %>%
+    group_split() %>% 
+    set_names(str_c(.y, "res1.8","cluster", map(., ~ .x %>% 
+           pull(cluster) %>% 
+           unique() %>% 
+           as.character()), sep = "_"))
+) %>% 
+  flatten() %>% 
+  openxlsx::write.xlsx(file = str_c(output, "FindAllMarker_integrated_clusteringResolution1.8.xlsx", sep = "/"))
+
+```
+
+```{r, eval=FALSE, include=FALSE}
+saveRDS(list("marker_genes_res_04" = cluster_marker_04,
+             "marker_genes_res_18" = cluster_marker_18), file = str_c(output, "seurat_indv_seurat_markergenes_integrated.rds", sep = "/"))
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+saveRDS(seurat_int_reg$integrated, file = str_c(output, "seurat_indv_seurat_integrated.rds", sep = "/"))
+```
+
+
+
+
+
