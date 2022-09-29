@@ -1,0 +1,202 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Integrating across all samples using the reference-based approach
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+The following integrates the samples using the untreated sample as a reference. The approach is described [here](https://satijalab.org/seurat/v3.1/integration.html
+
+```{r}
+RMD_file_name <- "1-1.Integrate_samples_after_filtering_cluster"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+# File path to the individual Seurat object list (pre-processed to remove low quality cells, label suspected doublets)
+seurat_list <-
+  readRDS(
+    here(
+      "output",
+      "0-4.label_suspected_doublets",
+      "Seurat_individual_sample_pre-processed_doublets_labelled.rds"
+    )
+  )
+
+# Marker gene list provided
+marker_gene_list <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Midbrain_dopaminergic_neurons_marker_genes.xlsx"
+  ),
+  sheet = 2) %>%
+  mutate(symbol = str_to_upper(symbol) %>% 
+           str_trim()) %>% 
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map(
+    .,
+    ~ .x$cell_type %>% unique() %>% 
+      str_replace_all(" ", "_") %>% 
+      str_replace_all("/", "_")
+  ))
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+While we removed suspected low quality cells previously, we did not filter out cells that are suspected doublets. Nonetheless, we labelled the suspected doublets both by setting a cut-off of more than 7000 detected features and also by identifying the suspected doublets with DoubletFinder.
+```{r fig.height=12, fig.width=18, message=FALSE, warning=FALSE}
+purrr::imap(seurat_list, function(Seur_obj, Seur_name) {
+  sub_text <- Seur_obj@project.name %>%
+    str_replace("_|\\.", " ") 
+  
+  ggarrange(
+ DimPlot(Seur_obj, label = TRUE, group.by = "doublet_cutoff_7000") +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with cut-off\nnumber of features > 7000") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE, group.by = colnames(Seur_obj[[]])[str_detect(colnames(Seur_obj[[]]), "^DF")]) +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with DoubletFinder") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE, group.by = "RNA_snn_res.1") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 1") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+    annotate_figure(top = text_grob(sub_text,
+                                    face = "bold",
+                                    size = 12))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_list),
+    ncol = 1,
+    align = "hv"
+  ) %>%
+  annotate_figure(
+    top = text_grob(
+      "Labelling suspected doublets",
+      face = "bold",
+      size = 16
+    )
+  )
+```
+
+We are using the "standard " workflow to integrate the datasets
+```{r normalize-variable-features, eval=TRUE, include=TRUE}
+# Normalize and find variable features in each of the individual datasets
+seurat_list <-
+  map(seurat_list, function(Seur_obj) {
+    NormalizeData(Seur_obj)
+  })
+seurat_list <-
+  map(seurat_list, function(Seur_obj) {
+    FindVariableFeatures(Seur_obj,
+                         selection.method = "vst",
+                         nfeatures = 2000)
+  })
+```
+
+```{r}
+# reference_dataset <- meta_data %>%
+#   filter(condition == "0h_none") %>%
+#   pull(sample_id)
+```
+
+Integrate the data using the anchors identified in the previous step. For the subsequent regression of the effect of the cell cycle set the `features.to.integrate` to all features, i.e. not just the variable ones as described [here](https://github.com/satijalab/seurat/issues/1500).
+
+Note that we ran the integration procedure twice, once with using a reference dataset and once without. We will subsequently compare the two integration procedures. (Note furthermore that only when using  the reference-dataset-based integration did we integrate across all features).
+```{r anchor-identification, eval=TRUE, include=TRUE}
+# Identify anchors for subsequent data integration, the dimensionality of the dataset is set to 30 by default but may be varied over a broad range, e.g. between 10 and 50
+anchors <-
+  FindIntegrationAnchors(
+    object.list = seurat_list,
+    dims = 1:50,
+    normalization.method = "LogNormalize"
+    # reference = which(names(seurat_list) == reference_dataset)
+  )
+```
+
+```{r}
+saveRDS(anchors,
+        file = str_c(output, "anchorset_for_integration.rds", sep = "/"))
+```
+
+```{r}
+feat_to_int <-
+  map(seurat_list, ~ rownames(.x)) %>% reduce(intersect)
+
+data_integrated <-
+  IntegrateData(
+    anchorset = anchors,
+    dims = 1:50,
+    features.to.integrate = feat_to_int
+  )
+
+data_integrated
+
+```
+
+```{r, eval=TRUE, include=TRUE}
+saveRDS(
+  data_integrated,
+  file = str_c(
+    output,
+    "seurat_list_filtered_integrated.rds",
+    sep = "/"
+  )
+)
+```

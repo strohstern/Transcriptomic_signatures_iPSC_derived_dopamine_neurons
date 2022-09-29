@@ -1,0 +1,423 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Comparing Integration approaches
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+We integrated across all samples with the "normal" pairwise approach.
+
+```{r}
+RMD_file_name <- "1-2.Clustering_of_integratated_dataset"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+```
+Enable parallelization with the `future` package as descibed [here](https://satijalab.org/seurat/v3.1/future_vignette.html).
+```{r message=FALSE, warning=FALSE}
+# library(future)
+# plan("multiprocess", workers = 4)
+# # increase the allowed object size that can be transfered between master and workers
+# options(future.globals.maxSize = 6000 * 1024^2)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+Seurat_obj_int <-
+  readRDS(
+    here(
+      "output",
+      "1-1.Integrate_samples_after_filtering_cluster",
+      "seurat_list_filtered_integrated.rds"
+    )
+  )
+
+# Marker gene list provided
+marker_gene_list <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Midbrain_dopaminergic_neurons_marker_genes.xlsx"
+  ),
+  sheet = 2) %>%
+  mutate(symbol = str_to_upper(symbol) %>%
+           str_trim()) %>%
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map(
+    .,
+    ~ .x$cell_type %>% unique() %>%
+      str_replace_all(" ", "_") %>%
+      str_replace_all("/", "_")
+  ))
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+```{r}
+Seurat_obj_int <- list("integrated" = Seurat_obj_int)
+```
+
+
+```{r}
+# Change the default assay from the "RNA" (raw data) to the "integrated" one; note that variable features of this assay are automatically set during IntegrateData
+Seurat_obj_int <- map(Seurat_obj_int, function(seur_obj){
+  DefaultAssay(seur_obj) <- "integrated"
+  seur_obj
+})
+```
+
+```{r}
+Seurat_obj_int$integrated
+```
+
+```{r cell-cycle-marker}
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+# as this data set is from mouse we set the markers to lower case
+Seurat_obj_int <- imap(Seurat_obj_int, function(seur_obj, seur_name) {
+  s_genes <- cc.genes$s.genes 
+  g2m_genes <- cc.genes$g2m.genes
+  
+  seur_obj <-
+    CellCycleScoring(
+      seur_obj,
+      s.features = s_genes,
+      g2m.features = g2m_genes,
+      set.ident = TRUE,
+      assay = "RNA"
+    )
+  seur_obj
+})
+
+```
+
+
+```{r scale-data, eval=TRUE, include=TRUE}
+Seurat_obj_int <- map(Seurat_obj_int, function(Seur_obj) {
+  Seur_obj <- ScaleData(Seur_obj)
+})
+```
+
+
+# Perform linear dimensional reduction
+
+PCA is performed on the scaled data using, by default, only the previously determined variable features as input. A different set of features can be defined using the `features` argument.
+```{r}
+Seurat_obj_int <- map(Seurat_obj_int, function(Seur_obj) {
+  RunPCA(Seur_obj, npcs = 50)
+})
+```
+
+```{r eval=FALSE, include=FALSE}
+map(Seurat_obj_int, function(Seur_obj) {
+  VizDimLoadings(Seur_obj, dims = 1:2, reduction = "pca")
+})
+```
+
+```{r eval=FALSE, include=FALSE}
+map(Seurat_obj_int, function(Seur_obj) {
+  DimPlot(Seur_obj, reduction = "pca")
+})
+```
+
+`DimHeatmap` allows for easy exploration of primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting `cells` to a number plots the "extreme" cells on both ends of the spectrum. While clearly a supervised analysis, this is provides a valuable tool for exploring correlated feature sets.
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+map(Seurat_obj_int, function(Seur_obj) {
+  DimHeatmap(Seur_obj, dims = 1, cells = 500, balanced = TRUE)
+})
+```
+
+```{r eval=FALSE, fig.height=12, include=FALSE}
+map2(Seurat_obj_int, names(Seurat_obj_int), function(Seur_obj, Seur_obj_name) {
+  DimHeatmap(Seur_obj, dims = 1:15, cells = 500, balanced = TRUE, fast = FALSE) %>% 
+    annotate_figure(top = text_grob(Seur_obj_name,
+                                            size = 32,
+                                            face = "bold"))
+})
+```
+
+# Determine the "dimensionality" of the dataset
+
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a "metafeature" that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. 
+The number of components that should be included in the analysis needs to be determined
+
+## JackStraw procedure
+
+Implementation of a resampling test inspired by the JackStraw procedure. Random permutation of the data (1% by default) and rerunning of PCA to construct a "null distribution" of feature scores, and repeating this procedure. "significant" PCs are identified as those which have a strong enrichment of low p-value features
+
+```{r eval=TURE, include=TRUE}
+Seurat_obj_int<- map(Seurat_obj_int, function(Seur_obj) {
+  Seur_obj <- JackStraw(Seur_obj, num.replicate = 100, dims = 50)
+  Seur_obj <- ScoreJackStraw(Seur_obj, dims = 1:50)
+  Seur_obj
+}
+)
+```
+
+When visualising the distribution of p-values for each PC with a uniform distribution (dashed line), "significant" PCs will show a strong enrichment of features with low p-values.
+```{r eval=TRUE, include=TRUE, fig.width=12}
+map2(Seurat_obj_int, names(Seurat_obj_int), function(Seur_obj, Seur_obj_name) {
+  JackStrawPlot(Seur_obj, dims = 1:50) +
+    ggtitle(Seur_obj_name)
+})
+```
+(Note that with 50 dimensions the JackStraw plot does not seem to approach the diagonal.)
+
+An alternative heuristic method generates an "Elbow plot": a ranking of principle components based on the percentage of variance explained by each one.
+```{r message=FALSE, warning=FALSE, fig.height=4, fig.width=8}
+map2(Seurat_obj_int, names(Seurat_obj_int), function(Seur_obj, Seur_obj_name) {
+  ElbowPlot(Seur_obj, ndims = 50)  +
+    ggtitle(Seur_obj_name)
+}) %>% ggarrange(plotlist = ., nrow = 1, ncol = length(Seurat_obj_int))
+```
+
+three suggested approaches to consider to identify the dimensionality of a dataset:
+
+1. exploring PCs to determine relevant sources of heterogeneity, which could be used, for example, in conjunction with GSEA
+2. statistical test based on a random null model, but is time-consuming for large datasets and may not return a clear PC cutoff
+3. commonly used heuristic, that can be calculated instantly
+
+In this case we use 50 PCs as cutoffs (the elbow plot flattens but the Jack-Straw plot shows that it is still significant).
+
+```{r}
+Seurat_obj_int$integrated@misc$nb_PCs <- 45
+```
+
+
+# Cluster the cells
+
+Seurat v3 applies a graph-based clustering approach. The distance metric drives the clustering analysis based on previously identified PCs. The approach to partioning the cellular distance matric into cluster was heavily inspired by [SNN-Cliq, Xu and Su, Bioinformatics, 2015](bioinformatics.oxfordjournals.org/content/early/2015/02/10/bioinformatics.btv088.abstract) and [PhenoGraph, Levine et al., Cell, 2015](https://www.ncbi.nlm.nih.gov/pubmed/26095251). 
+These methods embed cells in a graph structure, e.g. K-nearest neighbour (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected "quasi-cliques" or "communities".
+Seurat v3 first constructs a KNN graph based on the euclidian distance in PCA splace, and refine the edge weights between any two cells based on the shared overlap in their local neighbourhoods (Jaccard similarity).
+To cluster the cells, Seurat v3 next applies modularity optimisation techniques such as the Louvain algorithm (default) or [SLM](https://iopscience.iop.org/article/10.1088/1742-5468/2008/10/P10008) to iteratively group cells together, with the goal of optimizing the standard modularity function.
+The `FindClusters` function contains a resolution parameter that sets the "granularity" of the downstream clustering, with increased values leading to greater number of clusters. 
+The clusters can be found using the `Idents` function.
+```{r message=FALSE, warning=FALSE}
+Seurat_obj_int <-
+  map(Seurat_obj_int, function(Seur_obj) {
+    FindNeighbors(Seur_obj, dims = 1:Seur_obj@misc$nb_PCs)
+  })
+```
+
+
+# Run non-linear dimensional reduction (UMAP/tSNE)
+
+Seurat offers several non-linear reduction techniques, such as tSNE and UMAP, to visualise and explore datasets. The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimension space. Cells within the graph-based clusters determined above should co-localise on these dimension reducion plots. As input to the UMAP and tSNE, suggest to use the same PCs as input to the clustering analysis
+
+```{r message=FALSE, warning=FALSE}
+Seurat_obj_int <-
+  map(Seurat_obj_int, function(Seur_obj) {
+    RunUMAP(Seur_obj, dims = 1:Seur_obj@misc$nb_PCs)
+  })
+```
+
+We identify cluster with a resolution of 0.8 (default). We optimize the clustering resolution upon integration of the datasets.
+```{r message=FALSE, warning=FALSE}
+Seurat_obj_int <- map(Seurat_obj_int,  function(Seur_obj){
+  FindClusters(Seur_obj,  resolution = c(0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8))
+})
+```
+
+```{r fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+map2(Seurat_obj_int, names(Seurat_obj_int), function(Seur_obj, Seur_obj_name) {
+  DimPlot(Seur_obj,
+          reduction = "umap",
+          label = TRUE,
+          group.by = "integrated_snn_res.0.8") +
+    labs(title = (Seur_obj_name %>%
+                    str_replace_all("_", " "))) +
+    NoLegend() +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL)
+}) %>%
+  ggarrange(
+    plotlist = .,
+    align = "hv",
+    ncol = length(Seurat_obj_int),
+    nrow = 1
+  ) %>%
+  annotate_figure(top = text_grob(
+    "Clustering with resolution 0.8",
+    size = 24,
+    face = "bold"
+  ))
+```
+
+```{r eval=TRUE, include=TRUE}
+saveRDS(
+  Seurat_obj_int,
+  file = str_c(
+    output,
+    "Seurat_obj_int_seurat_filtered_integrated_pre-processed.rds",
+    sep = "/"
+  )
+)
+```
+
+```{r}
+Seurat_obj_int <-
+  readRDS(str_c(output, "Seurat_obj_int_seurat_filtered_integrated_pre-processed.rds", sep = "/"))
+```
+
+```{r  message=FALSE, warning=FALSE}
+map2(Seurat_obj_int, names(Seurat_obj_int), function(Seur_obj, Seur_obj_name) {
+  DimPlot(Seur_obj, reduction = "umap", group.by = "orig.ident") +
+    labs(title = Seur_obj_name) +
+    # NoLegend() +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL)
+}) %>%
+  ggarrange(
+    plotlist = .,
+    align = "hv",
+    ncol = length(Seurat_obj_int),
+    nrow = 1
+  ) %>%
+  annotate_figure(top = text_grob(
+    "Integration across replicates",
+    size = 24,
+    face = "bold"
+  ))
+```
+
+# Check mitochondrial percentage and cell cycle stage across clusters
+
+To ensure that the clustering is not driven entirely by cells with different percentages of mitochondrial gene expression or by cell cycle stages, we visually inspected the clusters for these two parameters.
+
+```{r fig.height=6, fig.width=18, message=FALSE, warning=FALSE}
+map(names(Seurat_obj_int), function(Seur_name) {
+  Seur_obj <- Seurat_obj_int[[Seur_name]]
+  sub_text <- Seur_name
+  
+  ggarrange(
+    FeaturePlot(
+      Seur_obj,
+      features = c("percent_mito"),
+      min.cutoff = c(0),
+      max.cutoff = c(20)
+    ) +
+      scale_colour_continuous(name = "Percent\nmitochondrial\ngene expression",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Mitochondrial\ngene expression", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    FeaturePlot(
+      Seur_obj,
+      features = c("nFeature_RNA"),
+      min.cutoff = c(1000),
+      max.cutoff = c(6000)
+    ) +
+      scale_colour_continuous(name = "Number of\ndetected genes",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Number of detected genes", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE) +
+      NoLegend() +
+      labs(subtitle = "Default cluster") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+    annotate_figure(top = text_grob(sub_text,
+                                    face = "bold",
+                                    size = 16))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(Seurat_obj_int),
+    ncol = 1,
+    align = "hv"
+  ) 
+```
+
+# Marker gene expression
+
+```{r}
+marker_gene_list$Cholinergic <- NULL
+```
+
+
+```{r fig.height=12, fig.width=12, message=FALSE, warning=FALSE}
+imap(marker_gene_list, function(gene_list, gene_list_name) {
+  map(names(Seurat_obj_int), function(Seur_name) {
+    Seur_obj <- Seurat_obj_int[[Seur_name]]
+    sub_text <- Seur_obj@project.name %>%
+      str_replace("_|\\.", " ") 
+    # gene_list
+    DotPlot(Seur_obj,
+            features = gene_list$symbol,
+            col.min = 0) +
+      ggtitle(sub_text) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(
+          angle = 90,
+          hjust = 1,
+          vjust = 0.5
+        )
+      )
+  }) %>%
+    ggarrange(
+      plotlist = .,
+      common.legend = TRUE,
+      legend = "bottom",
+      nrow = 2,
+      ncol = ceiling(length(Seurat_obj_int)/2),
+      align = "hv"
+    ) %>%
+    annotate_figure(top = text_grob(
+      str_c(gene_list_name, "marker genes", sep = " "),
+      size = 24,
+      face = "bold"
+    ))
+})
+```
