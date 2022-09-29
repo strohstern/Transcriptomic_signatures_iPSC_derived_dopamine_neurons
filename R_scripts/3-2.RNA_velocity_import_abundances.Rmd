@@ -13,7 +13,7 @@ module purge
 module load Anaconda3/2020.02
 conda activate scvelo-0.2.2
 
-cd projects/gandhis/sonia.gandhi/SC20054_Transcriptomic_signatures_iPSC_derived_dopamine_neurons/R-analysis/
+cd .
 
 R
 ```
