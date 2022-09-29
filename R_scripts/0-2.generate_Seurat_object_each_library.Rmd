@@ -1,0 +1,197 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Prepare a Seurat object for each library
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+The following prepares a Seurat object for each library. We keep the initial filtering of cells with less than 200 detected features when reading the 10x-data. 
+We also annotate the Seurat object with the necessary meta-information.
+
+```{r}
+RMD_file_name <- "0-2.generate_Seurat_object_each_library"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+```
+Enable parallelization with the `future` package as descibed [here](https://satijalab.org/seurat/v3.1/future_vignette.html)
+```{r message=FALSE, warning=FALSE}
+library(future)
+plan("multiprocess", workers = 4)
+# increase the allowed object size that can be transfered between master and workers
+options(future.globals.maxSize = 6000 * 1024^2)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+# File path to the base Cellranger count output
+file_path_10x <- here("input_data", "CellRanger_outputs")
+
+# Obtain the metadata information for each of the samples
+meta_data <-
+  openxlsx::read.xlsx(here("input_data",
+                           "SC20054.xlsx"),
+                      startRow = 2,
+                      colNames = TRUE) %>%
+  select(
+    sample_id = Sample.limsid,
+    sample_name = Sample.Name,
+    # condition = Sample.Treatment,
+    organism = Reference.Genome,
+    pred_nb_cells_captured = Predicted.Nb.of.Cells.Captured
+  ) %>%
+  mutate(project_name = str_c(sample_id, sample_name, sep = ".")) %>%
+  filter(pred_nb_cells_captured != 0) # remove samples which were not sequenced
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+```{r}
+sample_path_10x <-
+  dir(
+    file_path_10x,
+    recursive = TRUE,
+    pattern = "filtered_feature_bc_matrix$",
+    include.dirs = TRUE,
+    full.names = TRUE
+  )
+
+sample_path_10x <-
+  set_names(sample_path_10x,
+            str_extract(sample_path_10x, "GAN717A[0-9]*"))
+```
+
+# Read data and generate the Seurat object
+
+The initialisation of the Seurat object already includes a filtering step which removes cells with less than 200 detected features. We do not filter genes to enable merging datasets which requires the datasets to contain the same features.
+```{r}
+seurat_list <-
+  map2(sample_path_10x, names(sample_path_10x), function(file_path, sam_name) {
+    proj_name <- meta_data %>%
+      filter(sample_id == sam_name) %>%
+      pull(sample_id)
+    # proj_name
+    data_10x <- Read10X(data.dir = file_path)
+    # data_10x
+    CreateSeuratObject(
+      counts = data_10x,
+      project = proj_name,
+      min.cells = 0,
+      # include features detected in at least this many cells
+      min.features = 200
+    ) # include cells where at least this many features are detected
+  })
+```
+
+We filter the seurat objects to only keep those features that are deteced in at least 3 cells within one sample. To ensure that all libraries contain the same genes we then merge the gene lists from each of the samples and use this final list to subset each seurat object to contain the full gene list.
+```{r}
+# Identify those genes that are detected in at least 3 cells in one of the libraries (samples)
+genes_detected <- map(seurat_list, function(seur_obj) {
+  GetAssayData(seur_obj, assay = "RNA", slot = "counts") %>%
+  {
+    Matrix::rowSums(. != 0)
+  } %>%
+    enframe(name = "gene_id", value = "number_of_cells") %>%
+    filter(number_of_cells >= 3) %>%
+    select(gene_id)
+}) %>%
+  purrr::reduce(full_join, by = "gene_id") %>%
+  pull(gene_id)
+```
+
+```{r}
+seurat_list <- map(seurat_list, function(seur_obj){
+  subset(seur_obj, features = genes_detected)
+})
+```
+
+```{r}
+rm(genes_detected)
+```
+
+
+```{r}
+seurat_list <-
+  imap(seurat_list, function(seur_obj, seur_name) {
+    # Add a meaningful project name to each Seurat object representing a library
+    seur_obj@project.name <- meta_data %>%
+      filter(sample_id == seur_name) %>%
+      pull(project_name)
+    # Add metadata (in misc slot) about which organism the sample stems from
+    seur_obj@misc$organism <- meta_data %>%
+      filter(sample_id == seur_name) %>%
+      pull(organism)
+    # Calculate the percentage of mitochondrial gene expression. Note that the following works for mouse and human.
+    seur_obj[["percent_mito"]] <-
+      PercentageFeatureSet(seur_obj, pattern = "^mt-|^MT-")
+    
+    seur_obj
+  })
+```
+
+# Project-specific metadata
+We annotate the meta-data for this project further to include treatment, time and other available condition information.
+
+```{r}
+seurat_list <-
+  imap(seurat_list, function(seur_obj, seur_name) {
+    # Add a meaningful project name to each Seurat object representing a library
+    further_info <- meta_data %>%
+      filter(sample_id == seur_name) %>%
+      select(sample_name, pred_nb_cells_captured)
+    cells_seur <-   Cells(seur_obj) %>%
+      enframe(value = "cell_id") %>%
+      select(-name)
+    
+    further_info <-
+      map_dfr(seq_len(NROW(cells_seur)), ~ further_info) %>%
+      bind_cols(cells_seur) %>%
+      column_to_rownames(var = "cell_id")
+    
+    # Metadata can be added using a dataframe with rownames being cell IDs
+    seur_obj <-
+      AddMetaData(object = seur_obj, metadata = further_info)
+    seur_obj
+  })
+```
+
+```{r}
+saveRDS(
+  seurat_list,
+  file = str_c(
+    output,
+    "unprocessed_individual_seurat_object_list.RDS",
+    sep = "/"
+  )
+)
+```
+

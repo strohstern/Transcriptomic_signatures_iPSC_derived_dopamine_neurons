@@ -1,0 +1,337 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Removing suspected Doublets from Seurat objects
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+Before integration, we will label suspected doublets in each of the Seurat objects.
+Originally, we identified suspected doublets by removing those cells with a very high number of features expressed (either by using a hard cut-off or removing top ~5-8% depending on the number of cells loaded/expected (check [this post](https://bioinformatics.stackexchange.com/questions/3211/determining-doublets-in-single-cell-rna-seq) for further information)).
+Additionally, some computational methods for doublet identification have been developed:
+
+* [DoubletFinder](https://www.sciencedirect.com/science/article/pii/S2405471219300730)
+* [DoubletDecon](https://www.sciencedirect.com/science/article/pii/S2211124719312860)
+
+```{r}
+RMD_file_name <- "0-4.label_suspected_doublets"
+```
+
+```{r}
+set.seed(42)
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+library(clustree)
+
+library(DoubletFinder)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+# File path to the base Cellranger count output
+seurat_list <-
+  readRDS(
+    here(
+      "output",
+      "0-3.Initial_QC_filter_out_cluster",
+      "Seurat_individual_sample_pre-processed.rds"
+    )
+  )
+
+# Marker gene list provided by Gurvir Virdi
+marker_gene_list <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Midbrain_dopaminergic_neurons_marker_genes.xlsx"
+  ),
+  sheet = 2) %>%
+  mutate(symbol = str_to_upper(symbol) %>% 
+           str_trim()) %>% 
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map(
+    .,
+    ~ .x$cell_type %>% unique() %>% 
+      str_replace_all(" ", "_") %>% 
+      str_replace_all("/", "_")
+  ))
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+
+While we removed suspected low quality cells previously, we did not filter out cells that are suspected doublets. Rather than removing these cells we will label them as doublets and investigate their behaviour in the subsequent analysis.
+```{r}
+full_join(purrr::map_dfr(seurat_list, function(seur_obj) {
+  seur_obj[[]] %>% 
+    pull(pred_nb_cells_captured) %>% 
+    unique()
+}) %>% 
+  gather(sample_id, predicted_nb_cells),
+
+purrr::map_dfr(seurat_list, function(seur_obj) {
+  ncol(seur_obj)
+}) %>% 
+  gather(sample_id, nb_cells_captured), 
+by = "sample_id")
+```
+
+```{r fig.width=8, warning=FALSE}
+purrr::map(seurat_list, function(Seur_obj) {
+  Seur_obj[[]]
+}) %>%
+  reduce(bind_rows) %>%
+  ggplot(aes(x = nFeature_RNA, colour = orig.ident)) +
+  geom_vline(xintercept = c(1300, 7000), colour = "grey65") +
+  geom_density() +
+  ggtitle("Density plot for the number of expressed features")
+```
+
+As a first approximation we use those cells with more than 7000 detected features. Note that the usage of DoubletFinder may make this step more appropriate.
+
+```{r filter-doublets, eval=TRUE, include=TRUE}
+seurat_list <-
+  purrr::map(seurat_list, function(Seur_obj) {
+    sus_doubl <-
+      Cells(subset(Seur_obj, subset = nFeature_RNA < 7000, invert = TRUE))
+    Seur_obj$doublet_cutoff_7000 <-
+      Seur_obj[[]] %>% as_tibble(rownames = "cell_id") %>%
+      mutate(doublet = if_else(cell_id %in% sus_doubl,
+                               "doublet",
+                               "single_cell")) %>%
+      pull(doublet)
+    Seur_obj
+  })
+```
+
+
+
+# DoubletFinder
+
+More information about the `DoubletFinder` package can be found [here](https://github.com/chris-mcginnis-ucsf/DoubletFinder).
+
+DoubletFinder performs 4 steps:
+
+1. Generate artificial doublets based on scRNA-seq data
+2. Preprocess merged real-artificial data
+3. Perform PCA an use PC distance matrix to find each cell's proportion of artificial k nearest neighbours (pANN)
+4. Rank order and threshold pANN values according to the expected number of doublets
+
+## pK Identification
+
+`pK` defines the PC neighbourhood size used to compute pANN (artificial k nearest neighbours), expressed as a proportion of the merged real-artificial data.
+Optimal pK values should be adjusted for each scRNA-seq dataset.
+In this case ground-truth doublet classification information is **not** available.
+
+The number of PCs used as estimated from PC elbow plot (see script `0-3.Initial_QC_filter_out_cluster.Rmd`). We used 30 PCs for each of the individual samples.
+```{r}
+bcmvn_list <- purrr::map(seurat_list, function(seur_obj) {
+  sweep_res <-
+    paramSweep_v3(seur_obj,
+                  PCs = 1:30,
+                  sct = FALSE,
+                  num.cores = 1)
+  sweep_stats <- summarizeSweep(sweep_res, GT = FALSE)
+  bcmvn_res <- find.pK(sweep_stats)
+  bcmvn_res
+})
+```
+
+
+
+```{r, fig.height=10, fig.width=6}
+purrr::imap(bcmvn_list, function(bcmvn_obj, bcmvn_name) {
+  max_pK <- bcmvn_obj %>%
+    filter(BCmetric == max(BCmetric)) %>%
+    pull(pK)  %>%
+    {
+      as.numeric(levels(.)[.])
+    }
+  bcmvn_obj %>%
+  ggplot(aes(
+    x = as.numeric(levels(pK)),
+    y = BCmetric,
+    group = 1
+  )) +
+  geom_vline(xintercept = max_pK,
+             colour = "red",
+             lty = 2) +
+  geom_point(colour = "#00ace6") +
+  geom_line(colour = "#00ace6") +
+  scale_x_continuous(breaks = seq(0, 0.3, 0.05)) +
+  labs(x = "pK", y = expression(BC[MVN]), title = bcmvn_name) +
+    geom_text(aes(label = max_pK, x = max_pK, y = 500), colour = "red")
+}) %>%
+  ggarrange(plotlist = .,
+            ncol = 2,
+            nrow = ceiling(length(.) / 2))
+```
+
+## Model homotypic doublets proportions
+
+The proportion of homotypic doublets depends on the number of identified cell states (cluster). To identify the clustering resolution to be used for this step we investigated the stability of identified cluster across different cluster resolutions.
+
+
+```{r, fig.height=6, fig.width=12}
+purrr::imap(seurat_list, function(Seur_obj, Seur_name){
+   clustree(Seur_obj, prefix = "RNA_snn_res.") +
+    ggtitle(str_c("Cluster identification across different clustering resolutions", Seur_name, sep = " ")) + 
+    theme(plot.title = element_text(size = 14, face = "bold"))
+})
+```
+
+We are using the number of cell states (cluster) identified with a clustering resolution of 1. In addition we assuming a doublet formation rate of ~5%.
+```{r}
+nExp_poi_adj <- purrr::map(seurat_list, function(seur_obj) { 
+  homotypic.prop <-
+    modelHomotypic(seur_obj$RNA_snn_res.1)
+  nExp_poi <- round(0.05 * ncol(seur_obj))
+  nExp_poi_adj <- round(nExp_poi * (1 - homotypic.prop))
+})
+```
+
+
+```{r}
+seurat_list <- purrr::imap(seurat_list, function(seur_obj, seur_name) {
+  max_pK <- bcmvn_list[[seur_name]] %>%
+    filter(BCmetric == max(BCmetric)) %>%
+    pull(pK)  %>%
+    {
+      as.numeric(levels(.)[.])
+    }
+  
+  doubletFinder_v3(
+    seur_obj,
+    PCs = 1:20,
+    pN = 0.25,
+    pK = max_pK,
+    nExp = nExp_poi_adj[[seur_name]],
+    reuse.pANN = FALSE,
+    sct = FALSE
+  )
+})
+```
+
+```{r}
+(percent_doublets <- purrr::map_dfr(seurat_list, function(seur_obj) {
+  seur_obj[[]] %>%
+    as_tibble(rownames = "cell_id") %>%
+    group_by_at(vars(starts_with("DF"))) %>%
+    summarise(nb_of_GEMS = n()) %>%
+    {
+      pivot_wider(data = .,
+                  names_from = colnames(.)[str_detect(colnames(.), "^DF")],
+                  values_from =
+                    nb_of_GEMS)
+    } %>%
+    mutate(percent_doublets = round(Doublet / Singlet * 100, digits = 2),
+           orig_ident = seur_obj$orig.ident %>% unique()) %>%
+    select(orig_ident, percent_doublets)
+}))
+
+```
+After re-running the code several times it is noticable that the pK value changes with every run, but the percentage of detected putative doublets with DoubletFinder seems to be stable.
+```{r}
+seurat_list$GAN717A1[[]]
+```
+
+
+```{r fig.height=12, fig.width=18, message=FALSE, warning=FALSE}
+purrr::imap(seurat_list, function(Seur_obj, Seur_name) {
+  sub_text <- Seur_obj@project.name %>%
+    str_replace("_|\\.", " ") 
+  
+  ggarrange(
+ DimPlot(Seur_obj, label = TRUE, group.by = "doublet_cutoff_7000") +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with cut-off (number of features > 7000") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE, group.by = colnames(Seur_obj[[]])[str_detect(colnames(Seur_obj[[]]), "^DF")]) +
+      NoLegend() +
+      labs(subtitle = "Doublets identified with DoubletFinder") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE, group.by = "RNA_snn_res.1") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 1") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+    annotate_figure(top = text_grob(sub_text,
+                                    face = "bold",
+                                    size = 12))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_list),
+    ncol = 1,
+    align = "hv"
+  ) %>%
+  annotate_figure(
+    top = text_grob(
+      "Filtering cells in clusters with high mitochodrial expression and low number of detected features",
+      face = "bold",
+      size = 16
+    )
+  )
+```
+
+```{r}
+saveRDS(
+  seurat_list,
+  file = str_c(
+    output,
+    "Seurat_individual_sample_pre-processed_doublets_labelled.rds",
+    sep = "/"
+  )
+)
+```
+
+

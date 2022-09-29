@@ -1,0 +1,788 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Inital QC of individual samples and filtering of clusters with high mitochondirial expression and low number of detected features
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r global_options, include=TRUE}
+knitr::opts_chunk$set(echo = FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+The following QC and pre-processing follows the workflow described in the [Seurat v3.1 tutorial](https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html).
+In contrast to the filtering described in the Seurat vignette, we identified cluster with high mitochondrial content and low feature counts.
+Note that we keep the initial filtering of cells with less than 200 detected features.
+
+```{r}
+RMD_file_name <- "0-3.Initial_QC_filter_out_cluster"
+```
+
+
+## Libraries
+
+```{r message=TRUE, warning=TRUE}
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(Seurat)
+library(clustree)
+```
+Enable parallelization with the `future` package as descibed [here](https://satijalab.org/seurat/v3.1/future_vignette.html)
+```{r message=TRUE, warning=TRUE}
+library(future)
+plan("multiprocess", workers = 4)
+# increase the allowed object size that can be transfered between master and workers
+options(future.globals.maxSize = 6000 * 1024^2)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+seurat_list <-
+  readRDS(
+    here(
+      "output",
+      "0-2.generate_Seurat_object_each_library",
+      "unprocessed_individual_seurat_object_list.RDS"
+    )
+  )
+
+# Marker gene list provided
+marker_gene_list <-
+  openxlsx::read.xlsx(here(
+    "input_data",
+    "Midbrain_dopaminergic_neurons_marker_genes.xlsx"
+  ),
+  sheet = 2) %>%
+  mutate(symbol = str_to_upper(symbol) %>% 
+           str_trim()) %>% 
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map(
+    .,
+    ~ .x$cell_type %>% unique() %>% 
+      str_replace_all(" ", "_") %>% 
+      str_replace_all("/", "_")
+  ))
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+# Read data and generate the Seurat object
+
+We load and prepared the Seurat objects for each of the libraries in script `0-2.generate_Seurat_object_each_library`. These Seurat objects include all necessary metadata, including condition, treatment, etc..
+In addition, we already calculated the percentage of mitochondrial gene expression for each object.
+The initialisation of the Seurat object already includes a filtering step which removes cells with less than 200 detected features. We do not filter genes to enable merging datasets which requires the datasets to contain the same features.
+
+# Selecting cells for further analysis
+
+[Commonly used QC metrics](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4758103/):
+
+* the number of unique genes detected in each cell
+    + low-quality cells or empty droplets will often have very few genes
+    + cell doublets or multiplets may exhibit an aberrantly high gene count
+* the total number of molecules detected within a cell (correlates strongly with unique genes)
+* the percentage of reads mapping to the mitochondrial genome
+    + low-quality/dying cells often exhibit extensive mitochondrial contamination
+    + calculate mitochondrial QC metrics with the `PercentageFeatureSet` function, which calculates the percentage of counts originating from a set of features
+    + use the set of all genes starting with `mt-`(mouse) or `MT-` (human) as a set of mitochondrial genes
+    
+Here, instead of filtering individual cells based on the mitochondrial gene expression percentage, we identify cluster with high mitochondrial gene expression and low feature couts. This approach ensures that cells with high mitochondrial gene expression (which can occur) are kept in the analysis.
+
+
+## Visualise QC metrics
+
+```{r eval=FALSE, fig.height=24, fig.width=8, include=FALSE}
+imap(seurat_list, function(Seur_obj, Seur_name) {
+  VlnPlot(
+    Seur_obj,
+    features = c("nFeature_RNA", "nCount_RNA", "percent_mito"),
+    ncol = 3
+  ) %>%
+    annotate_figure(top = text_grob(Seur_name, face = "bold", size = 18))
+}) %>%
+  ggarrange(plotlist = .,
+            ncol = 1,
+            nrow = length(seurat_list))
+```
+
+```{r eval=FALSE, fig.width=8, include=FALSE}
+# FeatureScatter is typically used to visualise feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+map(seurat_list, function(Seur_obj) {
+  CombinePlots(plots = list(
+    FeatureScatter(Seur_obj, 
+                   feature1 = "nCount_RNA", 
+                   feature2 = "percent_mito"),
+    FeatureScatter(Seur_obj, 
+                   feature1 = "nCount_RNA", 
+                   feature2 = "nFeature_RNA")
+  ),
+  legend = "bottom")
+})
+```
+
+```{r fig.width=8, warning=TRUE}
+(mito_plot <- map(seurat_list, function(Seur_obj) {
+  Seur_obj[[]]
+}) %>% 
+  reduce(bind_rows) %>%
+  ggplot(aes(x = percent_mito, colour = orig.ident)) +
+  geom_vline(xintercept = c(0.5, 7.5), color = "grey65") +
+  geom_density() +
+  ggtitle("Density plot for percentage of expressed mitochondrial genes") +
+  coord_cartesian(xlim = c(0, 15)))
+```
+
+The samples all have a distrution of mitochondrial expression ranging primarily between 0.5% and ~7.5%.
+
+```{r fig.width=8, warning=TRUE}
+(feature_plot <-map(seurat_list, function(Seur_obj) {
+  Seur_obj[[]]
+}) %>%
+  reduce(bind_rows) %>%
+  ggplot(aes(x = nFeature_RNA, colour = orig.ident)) +
+  geom_vline(xintercept = c(1300, 6000), colour = "grey65") +
+  geom_density() +
+  ggtitle("Density plot for the number of expressed features"))
+```
+
+In the majority of cells across all samples between 1300-6000 unique features were detected. 
+
+```{r eval=TRUE, include=TRUE}
+seurat_list <- map(seurat_list, function(Seur_obj) {
+  Seur_obj <- Seur_obj %>%
+    NormalizeData()
+  Seur_obj <- FindVariableFeatures(Seur_obj)
+  Seur_obj <- ScaleData(Seur_obj)
+  Seur_obj <- Seur_obj %>%
+    RunPCA(npcs = 30) %>%
+    FindNeighbors(dims = 1:30) %>%
+    RunUMAP(dims = 1:30) %>%
+    FindClusters(resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4))
+  Seur_obj
+})
+```
+
+```{r eval=TRUE, include=TRUE}
+saveRDS(seurat_list, file = str_c(output, "Seurat_individual_pre-processed.rds", sep = "/"))
+```
+
+```{r}
+seurat_list <-
+  readRDS(
+    str_c(
+      output,
+      "Seurat_individual_pre-processed.rds",
+      sep = "/"
+    )
+  )
+```
+
+## Investigation of the separation of clusters with differing  clustering resolutions
+
+We wil be using the average mitochondrial expresssion and the average number of features per cluster to perform the filtering of low-quality cells. We therefore investigate how these two parameters develop across different clustering resolutions.
+```{r, fig.height=6, fig.width=12}
+imap(seurat_list, function(Seur_obj, Seur_name){
+   clust_mito <- clustree(Seur_obj, prefix = "RNA_snn_res.", node_colour = "percent_mito", node_colour_aggr = "mean") +
+    ggtitle("Average percentage of\nmitochondrial gene expression") + 
+    theme(plot.title = element_text(size = 14, face = "bold"))
+  clust_feat <- clustree(Seur_obj, prefix = "RNA_snn_res.", node_colour = "nFeature_RNA", node_colour_aggr = "mean") +
+    ggtitle("Average number of features") + 
+    theme(plot.title = element_text(size = 14, face = "bold"))
+  ggarrange(clust_mito, clust_feat) %>% 
+    annotate_figure(top = text_grob(Seur_name, size = "18", face = "bold"))
+})
+
+```
+Based on the visualisation of average mitochondrial gene expression across cluster over different resolutions the most appropriate clustering resolution to use seems to be resolution 1.0. At this point the clustering seems to stabilise for the cluster with a high percentage of mitochondrial gene expression.
+
+## Filter cells
+
+Based on the distribution of the percentage of mitochondrial expression and the number of detected features, we removed cell clusters that show an average percentage of mitochondrial expression > 7.5% and less than an average 1300 detectable features across the cluster.
+```{r}
+clust_resolution_used <- "RNA_snn_res.1"
+avg_nFeature_used <- 1300
+avg_percent_mito_used <- 7.5
+## Filtering by average values per cluster
+filtered_cells <-
+  map(seurat_list, function(Seur_obj) {
+    clust_filt <- Seur_obj[[]] %>%
+      as_tibble(rownames = "cell_id") %>%
+      select(orig.ident, nFeature_RNA, percent_mito, all_of(clust_resolution_used)) %>%
+      group_by(!!sym(clust_resolution_used)) %>%
+      summarise(
+        orig.ident = unique(orig.ident),
+        avg_nFeature_RNA = mean(nFeature_RNA),
+        avg_percent_mito = mean(percent_mito)
+      ) %>%
+      arrange(desc(avg_percent_mito))
+    
+    clust_filt_out <- clust_filt %>%
+      filter(avg_nFeature_RNA < avg_nFeature_used & avg_percent_mito > avg_percent_mito_used) %>%
+      pull(clust_resolution_used) %>%
+      as.character()
+
+    if (length(clust_filt_out) != 0) {
+      cells_use <-
+        Cells(Seur_obj)[which(pull(Seur_obj[[clust_resolution_used]]) %in%
+                                clust_filt_out)]
+      seur_sub_out <-
+        subset(Seur_obj, cells = cells_use, invert = FALSE)
+      seur_sub_keep <-
+        subset(Seur_obj, cells = cells_use, invert = TRUE)
+    } else {
+      seur_sub_out <- NULL
+      seur_sub_keep <- Seur_obj
+    }
+    Cells_selected <- list("cells_out" = Cells(seur_sub_out),
+                           "cells_keep" = Cells(seur_sub_keep))
+
+    Cells_selected
+  })
+
+```
+
+```{r}
+## Number of cells filtered out
+(nb_filtered_cells <- map_dfr(filtered_cells, ~ .x$cells_out %>% length()) %>% 
+  gather(sample_id, nb_filtered_cells))
+```
+The number of filtered out "low quality" cells based on the combined average number of expressed features below `r avg_nFeature_used` and average percentage of mitochondrial gene expression above `r avg_percent_mito_used`% ranges between `r nb_filtered_cells %>% filter(nb_filtered_cells == min(nb_filtered_cells)) %>% pull(nb_filtered_cells)` (`r nb_filtered_cells %>% filter(nb_filtered_cells == min(nb_filtered_cells)) %>% pull(sample_id)`) and  `r nb_filtered_cells %>% filter(nb_filtered_cells == max(nb_filtered_cells)) %>% pull(nb_filtered_cells)` (`r nb_filtered_cells %>% filter(nb_filtered_cells == max(nb_filtered_cells)) %>% pull(sample_id)`) cells.
+
+```{r fig.height=12, fig.width=18, message=TRUE, warning=TRUE}
+(filter_plot <- map(names(seurat_list), function(Seur_name) {
+  Seur_obj <- seurat_list[[Seur_name]]
+  cells_out <- filtered_cells[[Seur_name]]$cells_out
+  cells_keep <- filtered_cells[[Seur_name]]$cells_keep
+  sub_text <- Seur_obj@project.name %>% 
+    str_replace("_|\\.", " ") 
+    
+  ggarrange(
+    FeaturePlot(
+      Seur_obj,
+      features = c("percent_mito"),
+      min.cutoff = c(0),
+      max.cutoff = c(10)
+    ) +
+      scale_colour_continuous(name = "Percent\nmitochondrial\ngene expression",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Mitochondrial\ngene expression", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    FeaturePlot(
+      Seur_obj,
+      features = c("nFeature_RNA"),
+      min.cutoff = c(200),
+      max.cutoff = c(6500)
+    ) +
+      scale_colour_continuous(name = "Number of\ndetected genes",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Number of detected genes", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    DimPlot(Seur_obj, label = TRUE, group.by = clust_resolution_used) +
+      NoLegend() +
+      labs(subtitle = str_c("Clustering with resolution", str_remove(clust_resolution_used, "RNA_snn_res."))) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    DimPlot(
+      Seur_obj,
+      cells.highlight = list("kept_cells" = cells_keep,
+                             "filtered_cells" = cells_out
+                             ),
+      cols.highlight = c("#DE2D26", "blue")
+    )  +
+      # NoLegend() +
+      labs(subtitle = "Cells filtered out") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+  annotate_figure(
+    top = text_grob(sub_text,
+      face = "bold",
+      size = 12))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_list),
+    ncol = 1,
+    align = "hv"
+  ) %>%
+  annotate_figure(
+    top = text_grob(
+      "Filtering cells in clusters with high mitochodrial expression and low number of detected features",
+      face = "bold",
+      size = 16
+    )
+  ))
+```
+
+```{r}
+saveRDS(
+  list(
+    "cluster_filtered" = filter_plot,
+    "raw_mito" = mito_plot,
+    "raw_feature" = feature_plot
+  ),
+  file = str_c(output, "Plots_illustrating_filtering_raw_data.rds", sep = "/")
+)
+```
+
+```{r fig.height=12, fig.width=18, message=TRUE, warning=TRUE}
+(exam_plot <- map(names(seurat_list)[1], function(Seur_name) {
+  Seur_obj <- seurat_list[[Seur_name]]
+  cells_out <- filtered_cells[[Seur_name]]$cells_out
+  cells_keep <- filtered_cells[[Seur_name]]$cells_keep
+  sub_text <- Seur_obj@project.name %>% 
+    str_replace("_|\\.", " ") 
+    
+  ggarrange(
+    FeaturePlot(
+      Seur_obj,
+      features = c("percent_mito"),
+      min.cutoff = c(0),
+      max.cutoff = c(10)
+    ) +
+      scale_colour_continuous(name = "Percent\nmitochondrial\ngene expression",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Mitochondrial\ngene expression", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    FeaturePlot(
+      Seur_obj,
+      features = c("nFeature_RNA"),
+      min.cutoff = c(200),
+      max.cutoff = c(6500)
+    ) +
+      scale_colour_continuous(name = "Number of\ndetected genes",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Number of detected genes", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    DimPlot(Seur_obj, label = TRUE, group.by = clust_resolution_used) +
+      NoLegend() +
+      labs(subtitle = str_c("Clustering with resolution", str_remove(clust_resolution_used, "RNA_snn_res."))) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    DimPlot(
+      Seur_obj,
+      cells.highlight = list("kept_cells" = cells_keep,
+                             "filtered_cells" = cells_out
+                             ),
+      cols.highlight = c("#DE2D26", "blue")
+    )  +
+      # NoLegend() +
+      labs(subtitle = "Cells filtered out") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+
+    align = "hv",
+    nrow = 2,
+    ncol = 2
+  ) %>%
+  annotate_figure(
+    top = text_grob(sub_text,
+      face = "bold",
+      size = 12))
+  
+}))
+
+ggsave(exam_plot[[1]], filename = str_c(figures_out, "filtered_cells_example.png", sep = "/"), width = 12)
+```
+
+##  Subset Seurat object
+
+```{r} 
+seurat_list_sub <- map(names(seurat_list), function(Seur_name) {
+      Seur_sub <-
+    subset(seurat_list[[Seur_name]],
+           cells = filtered_cells[[Seur_name]]$cells_keep,
+           invert = FALSE)
+   
+}) %>% 
+  set_names(names(seurat_list))
+
+seurat_list_sub
+```
+
+
+# Processing filtered data sets
+
+Following the filtering of cell cluster with an average percentage of mitochondrial expression above 7.5% and, concomitantly, less than an average of 1300 detected features, we processed the data to identify cell cluster.
+
+```{r eval=TRUE, include=TRUE}
+seurat_list_sub <- map(seurat_list_sub, function(Seur_obj) {
+  Seur_obj <- NormalizeData(Seur_obj)
+  Seur_obj <- FindVariableFeatures(Seur_obj)
+  Seur_obj <- ScaleData(Seur_obj)
+}) %>%
+  set_names(names(seurat_list))
+
+saveRDS(seurat_list_sub, file = str_c(output, "Seurat_individual_filtered.rds", sep = "/"))
+```
+
+```{r}
+rm(seurat_list)
+```
+
+```{r}
+seurat_list_sub <-
+  readRDS(
+    str_c(
+      output,
+      "Seurat_individual_filtered.rds",
+      sep = "/"
+    )
+  )
+```
+
+```{r mito-percent-cal-sub}
+seurat_list_sub <- map(seurat_list_sub, function(Seur_obj) {
+  Seur_obj[["percent_mito"]] <-
+    PercentageFeatureSet(Seur_obj, pattern = "^mt-|^MT-")
+  Seur_obj
+})
+``` 
+
+# Cell cycle scoring
+
+Using the cell cycle markers provided in Seurat we score each cell to identify its cell cycle state.
+We perform cell cycle scoring to investigate the distribution of cell cycle states across clusters. 
+Seurat also allows to regress out the effect of the cell cycle states on the clustering, however for tissues/samples in which differentiation processes are investigated this may be not advisable.
+
+```{r}
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+# as this data set contains samples from mouse we set the markers to lower case
+seurat_list_sub <- imap(seurat_list_sub, function(Seur_obj, Seur_name) {
+  org <- Seur_obj@misc$organism
+  if (org == "Mus musculus") {
+    s_genes <- cc.genes$s.genes %>%
+      str_to_title()
+    s_genes <-
+      c(s_genes, "Cenpu") # the official gene name for Mlf1ipis Cenpu
+    g2m_genes <- cc.genes$g2m.genes %>%
+      str_to_title()
+  } else if (org == "Homo sapiens") {
+    s_genes <- cc.genes$s.genes
+    g2m_genes <- cc.genes$g2m.genes
+  } else {
+    print("The supplied organism is not available.")
+    next
+  }
+  CellCycleScoring(
+    Seur_obj,
+    s.features = s_genes,
+    g2m.features = g2m_genes,
+    set.ident = TRUE
+  )
+}) %>% set_names(names(seurat_list_sub))
+```
+
+# Perform linear dimensional reduction
+
+PCA is performed on the scaled data using, by default, only the previously determined variable features as input. A different set of features can be defined using the `features` argument.
+```{r}
+seurat_list_sub <- map(seurat_list_sub, function(Seur_obj) {
+  RunPCA(Seur_obj)
+})
+```
+
+
+```{r eval=FALSE, include=FALSE}
+map(seurat_list_sub, function(Seur_obj) {
+  VizDimLoadings(Seur_obj, dims = 1:2, reduction = "pca")
+})
+```
+
+```{r eval=FALSE, include=FALSE}
+map(seurat_list_sub, function(Seur_obj) {
+  DimPlot(Seur_obj, reduction = "pca")
+})
+```
+
+`DimHeatmap` allows for easy exploration of primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting `cells` to a number plots the "extreme" cells on both ends of the spectrum. While clearly a supervised analysis, this is provides a valuable tool for exploring correlated feature sets.
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+map(seurat_list_sub, function(Seur_obj) {
+  DimHeatmap(Seur_obj, dims = 1, cells = 500, balanced = TRUE)
+})
+```
+
+```{r eval=FALSE, fig.height=12, include=FALSE}
+map2(seurat_list_sub, names(seurat_list_sub), function(Seur_obj, Seur_obj_name) {
+  DimHeatmap(Seur_obj, dims = 1:15, cells = 500, balanced = TRUE, fast = FALSE) %>% 
+    annotate_figure(top = text_grob(Seur_obj@project.name,
+                                            size = 32,
+                                            face = "bold"))
+})
+```
+
+# Determine the "dimensionality" of the dataset
+
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a "metafeature" that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. 
+The number of components that should be included in the analysis needs to be determined
+
+## JackStraw procedure
+
+Implementation of a resampling test inspired by the JackStraw procedure. Random permutation of the data (1% by default) and rerunning of PCA to construct a "null distribution" of feature scores, and repeating this procedure. "significant" PCs are identified as those which have a strong enrichment of low p-value features
+
+```{r eval=TRUE, include=TRUE}
+seurat_list_sub <- map(seurat_list_sub, function(Seur_obj) {
+  Seur_obj <- JackStraw(Seur_obj, num.replicate = 100, dims = 50)
+  Seur_obj <- ScoreJackStraw(Seur_obj, dims = 1:50)
+  Seur_obj
+}
+)
+```
+
+When visualising the distribution of p-values for each PC with a uniform distribution (dashed line), "significant" PCs will show a strong enrichment of features with low p-values.
+```{r eval=TRUE, include=TRUE}
+map2(seurat_list_sub, names(seurat_list_sub), function(Seur_obj, Seur_obj_name) {
+  JackStrawPlot(Seur_obj, dims = 1:50) +
+    ggtitle(Seur_obj_name)
+})
+```
+(Note that with 50 dimensions the JackStraw plot does not seem to approach the diagonal)
+
+An alternative heuristic method generates an "Elbow plot": a ranking of principle components based on the percentage of variance explained by each one.
+```{r message=TRUE, warning=TRUE, fig.height=8, fig.width=6}
+map2(seurat_list_sub, names(seurat_list_sub), function(Seur_obj, Seur_obj_name) {
+  ElbowPlot(Seur_obj, ndims = 50)  +
+    ggtitle(Seur_obj_name)
+}) %>%
+  ggarrange(plotlist = .,
+            nrow = ceiling(length(seurat_list_sub) / 2),
+            ncol = 2)
+```
+
+three suggested approaches to consider to identify the dimensionality of a dataset:
+
+1. exploring PCs to determine relevant sources of heterogeneity, which could be used, for example, in conjunction with GSEA
+2. statistical test based on a random null model, but is time-consuming for large datasets and may not return a clear PC cutoff
+3. commonly used heuristic, that can be calculated instantly
+
+In this case we use 30 PCs as cutoffs (Note that this is only for the individual QC, after integration we assess the number of PCs used again).
+
+# Cluster the cells
+
+Seurat v3 applies a graph-based clustering approach. The distance metric drives the clustering analysis based on previously identified PCs. The approach to partioning the cellular distance matric into cluster was heavily inspired by [SNN-Cliq, Xu and Su, Bioinformatics, 2015](bioinformatics.oxfordjournals.org/content/early/2015/02/10/bioinformatics.btv088.abstract) and [PhenoGraph, Levine et al., Cell, 2015](https://www.ncbi.nlm.nih.gov/pubmed/26095251). 
+These methods embed cells in a graph structure, e.g. K-nearest neighbour (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected "quasi-cliques" or "communities".
+Seurat v3 first constructs a KNN graph based on the euclidian distance in PCA splace, and refine the edge weights between any two cells based on the shared overlap in their local neighbourhoods (Jaccard similarity).
+To cluster the cells, Seurat v3 next applies modularity optimisation techniques such as the Louvain algorithm (default) or [SLM](https://iopscience.iop.org/article/10.1088/1742-5468/2008/10/P10008) to iteratively group cells together, with the goal of optimizing the standard modularity function.
+The `FindClusters` function contains a resolution parameter that sets the "granularity" of the downstream clustering, with increased values leading to greater number of clusters. 
+The clusters can be found using the `Idents` function.
+```{r message=TRUE, warning=TRUE}
+seurat_list_sub <-
+  map(seurat_list_sub, function(Seur_obj) {
+    FindNeighbors(Seur_obj, dims = 1:30)
+  })
+```
+
+
+# Run non-linear dimensional reduction (UMAP/tSNE)
+
+Seurat offers several non-linear reduction techniques, such as tSNE and UMAP, to visualise and explore datasets. The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimension space. Cells within the graph-based clusters determined above should co-localise on these dimension reducion plots. As input to the UMAP and tSNE, suggest to use the same PCs as input to the clustering analysis
+
+```{r message=TRUE, warning=TRUE}
+seurat_list_sub <-
+  map(seurat_list_sub, function(Seur_obj) {
+    RunUMAP(Seur_obj, dims = 1:30)
+  })
+```
+
+We identify cluster with a resolution of 0.8 (default). We optimize the clustering resolution upon integration of the datasets.
+```{r message=TRUE, warning=TRUE}
+seurat_list_sub <- map(seurat_list_sub,  function(Seur_obj){
+  FindClusters(Seur_obj, resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4))
+})
+```
+
+
+```{r fig.height=10, fig.width=8, message=TRUE, warning=TRUE}
+map2(seurat_list_sub, names(seurat_list_sub), function(Seur_obj, Seur_obj_name) {
+  DimPlot(Seur_obj, reduction = "umap", label = TRUE, group.by = "RNA_snn_res.0.8") +
+    labs(title = (Seur_obj@project.name %>%
+                    str_replace_all("_|\\.", " "))) +
+    NoLegend() +
+    coord_fixed(ratio = 1) +
+    scale_x_discrete(breaks = NULL) +
+    scale_y_discrete(breaks = NULL)
+}) %>%
+  ggarrange(
+    plotlist = .,
+    align = "hv",
+    ncol = 2,
+    nrow = ceiling(length(seurat_list_sub) / 2)
+  ) %>%
+  annotate_figure(top = text_grob(
+    "Clustering with resolution 0.8",
+    size = 24,
+    face = "bold"
+  ))
+```
+
+```{r eval=TRUE, include=TRUE}
+saveRDS(seurat_list_sub, file = str_c(output, "Seurat_individual_sample_pre-processed.rds", sep = "/"))
+```
+
+```{r}
+seurat_list_sub <-
+  readRDS(file = str_c(output, "Seurat_individual_sample_pre-processed.rds", sep = "/"))
+```
+
+# Check mitochondrial percentage and cell cycle stage across clusters
+
+To ensure that the clustering is not driven entirely by cells with different percentages of mitochondrial gene expression or by cell cycle stages, we visually inspected the clusters for these two parameters.
+
+```{r fig.height=12, fig.width=18, message=TRUE, warning=TRUE}
+map(names(seurat_list_sub), function(Seur_name) {
+  Seur_obj <- seurat_list_sub[[Seur_name]]
+  sub_text <- Seur_obj@project.name %>%
+    str_replace("_|\\.", " ") 
+  
+  ggarrange(
+    FeaturePlot(
+      Seur_obj,
+      features = c("percent_mito"),
+      min.cutoff = c(0),
+      max.cutoff = c(10)
+    ) +
+      scale_colour_continuous(name = "Percent\nmitochondrial\ngene expression",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Mitochondrial\ngene expression", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    FeaturePlot(
+      Seur_obj,
+      features = c("nFeature_RNA"),
+      min.cutoff = c(1000),
+      max.cutoff = c(6000)
+    ) +
+      scale_colour_continuous(name = "Number of\ndetected genes",
+                              low = "lightgrey", high = "blue") +
+      labs(subtitle = "Number of detected genes", title = NULL) +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, label = TRUE, group.by = "RNA_snn_res.0.8") +
+      NoLegend() +
+      labs(subtitle = "Cluster with a resolution of 0.8") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    DimPlot(Seur_obj, reduction = "umap", group.by = "Phase") +
+      labs(subtitle = "Cell Cycle Phase") +
+      scale_colour_discrete(name = "Cell cycle\nphase") +
+      coord_fixed(ratio = 1) +
+      scale_x_discrete(breaks = NULL) +
+      scale_y_discrete(breaks = NULL),
+    
+    align = "hv",
+    nrow = 1,
+    ncol = 4
+  ) %>%
+    annotate_figure(top = text_grob(sub_text,
+                                    face = "bold",
+                                    size = 12))
+  
+}) %>%
+  ggarrange(
+    plotlist = .,
+    nrow = length(seurat_list_sub),
+    ncol = 1,
+    align = "hv"
+  ) %>%
+  annotate_figure(
+    top = text_grob(
+      "Filtering cells in clusters with high mitochodrial expression and low number of detected features",
+      face = "bold",
+      size = 16
+    )
+  )
+```
+
+# Marker gene expression
+
+The samples from the dataset stem from iPSC-derived dopaminergic in vitro cultures. 
+
+```{r}
+marker_gene_list$Cholinergic <- NULL
+```
+
+```{r fig.height=8, fig.width=12, message=TRUE, warning=TRUE}
+imap(marker_gene_list, function(gene_list, gene_list_name) {
+  map(names(seurat_list_sub), function(Seur_name) {
+    Seur_obj <- seurat_list_sub[[Seur_name]]
+    sub_text <- Seur_obj@project.name %>%
+    str_replace("_|\\.", " ") 
+    
+    # gene_list
+    DotPlot(Seur_obj,
+            features = gene_list$symbol,
+            col.min = 0) +
+      ggtitle(sub_text) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(
+          angle = 90,
+          hjust = 1,!
+          vjust = 0.5
+        )
+      )
+  }) %>%
+    ggarrange(
+      plotlist = .,
+      common.legend = TRUE,
+      legend = "bottom",
+      nrow = 2,
+      ncol = ceiling(length(seurat_list_sub)/2),
+      align = "hv"
+    ) %>%
+    annotate_figure(top = text_grob(
+      str_c(gene_list_name, "marker genes", sep = " "),
+      size = 24,
+      face = "bold"
+    ))
+})
+```
