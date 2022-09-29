@@ -1,0 +1,103 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: RNA velocity estimation with scVelo - quantification with Alevin (Salmon)
+output:
+  html_document:
+    df_print: paged
+---
+
+The scVelo environment contains R4.0.3 as some of the packages required in R are only available with the most recent Bioconductor release. (use the following conda environment: `scvelo-0.2.2`)
+```{bash, eval=False}
+module purge
+module load Anaconda3/2020.02
+conda activate scvelo-0.2.2
+
+cd .
+
+R
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "3-1.RNA_velocity_quantification_with_Alevin"
+```
+
+In the following we follow the tutorial for [Alevin Velocity](https://combine-lab.github.io/alevin-tutorial/2020/alevin-velocity/):
+
+# Libraries
+```{r}
+library(tidyverse)
+library(here)
+```
+
+The fastq files are associated with the following sequencing runs:
+
+All the folders can be accessed through:
+`~/primary_data/`
+
+Get the location of the fastq files
+```{r}
+file_information <- read_csv("./input/SC20054_design.csv") %>% 
+  select_if(~any(!is.na(.))) %>% 
+  filter(!is.na(fastq_1)) %>%
+    mutate(
+      fastq_id = str_remove_all(fastq_1, "^/.*ments/fastq/") %>%
+        str_replace("/fastq/SC20054/", "_") %>%
+        str_replace("_R\\d_", "_")) %>% 
+  group_by(sample_lims) %>% 
+  group_split() %>% 
+  set_names(map(., ~ .x$sample_lims %>% unique()))
+```
+
+
+After the generation of the index, exonic and intronic abundances are quantified with [Alevin](https://salmon.readthedocs.io/en/latest/alevin.html).
+
+```{bash, eval=FALSE}
+almon alevin -l ISR -i Mus_musculus.GRCm38.89.expanded \
+-1 AdultMouseRep3_S1_L001_R1_001.fastq.gz \
+-2 AdultMouseRep3_S1_L001_R2_001.fastq.gz \
+-o alevin_out -p 32 --tgMap Mus_musculus.GRCm38.89.annotation.expanded.tx2gene.tsv \
+--chromiumV3 --dumpFeatures
+```
+
+```{r}
+imap(file_information, function(sampl, sampl_nam) {
+  read1_info <- str_c(sampl$fastq_1, collapse = " ")
+  read2_info <- str_c(sampl$fastq_2, collapse = " ")
+  organism <- unique(sampl$species) %>%  str_replace(" ", "_")
+  slurm_cmd <-
+    str_c(
+      "sbatch -c 32 --time=24:00:00  --output=./alevin_quantification/",
+      sampl_nam,
+      ".log ./scripts/Run_alevin_quantification.sh '",
+      read1_info,
+      "' '",
+      read2_info,
+      "' ",
+      sampl_nam,
+      " '",
+      organism,
+      "'",
+      sep = ""
+    )
+  system(slurm_cmd)
+  slurm_cmd
+})
+```
+
+
+
+
+
+
+
+
+
+

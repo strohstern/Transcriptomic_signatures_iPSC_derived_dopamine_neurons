@@ -1,0 +1,214 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: RNA velocity estimation with scVelo - integration with prior Seurat results
+output:
+  html_document:
+    df_print: paged
+---
+
+The scVelo environment contains R4.0.3 as some of the packages required in R are only available with the most recent Bioconductor release. (use the following conda environment: `scvelo-0.2.2`)
+```{bash, eval=FALSE}
+module purge
+module load Anaconda3/2020.02
+conda activate scvelo-0.2.2
+
+cd .
+
+R
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "3-3.RNA_velocity_integration_with_Seurat"
+```
+
+
+
+# Libraries
+```{r}
+library(tidyverse)
+library(here)
+
+library(SingleCellExperiment)
+library(Seurat)
+
+library(SeuratDisk)
+library(SeuratWrappers)
+
+library(org.Hs.eg.db)
+```
+
+
+
+```{r}
+seurat_int <-
+  readRDS(
+    here(
+      "output",
+      "2-2.Summary_figures_for_paper",
+      "seurat_indv_seurat_integrated_doublet_reoved_cc_regressed.rds"
+    )
+  )
+
+alevin_sce <-
+  readRDS(
+    here(
+      "output",
+      "3-2.RNA_velocity_import_abundances",
+      "sce_objects_for_scVelo_unfiltered.RDS"
+    )
+  )
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+
+Rather than using the alevin-derived `SingleCellExperiment` objects as input into scVelo, we combine the count matrices for the spliced and unspliced reads with the existing Seurat object.
+The approach is detailed [here](http://htmlpreview.github.io/?https://github.com/satijalab/seurat-wrappers/blob/master/docs/scvelo.html).
+
+```{r}
+seurat_int$cell_states.0.4 <- as.character(seurat_int$cell_states.0.4)
+```
+
+
+Note that we need to ensure that the gene IDs in both instances are compatible.
+
+```{r}
+genes <- rownames(seurat_int)
+# obtain the Ensembl gene ID for filtering the SCE objects
+ens_ids <-
+  mapIds(
+    org.Hs.eg.db,
+    keys = genes,
+    column = "ENSEMBL",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+# remove genes with missing Ensembl gene IDs
+ens_ids <- ens_ids[!is.na(ens_ids)]
+
+ens_ids <- ens_ids %>%
+  enframe(name = "gene_id", value = "ensembl_id") %>%
+  filter(!(
+    gene_id %in% c("LINC00473", "C9orf47", "CYP17A1-AS1", "LINC00908", "TTTY15") #these gene IDs don't exist as such at Ensembl
+  )) %>%
+  {
+    structure(.$gene_id, names = .$ensembl_id)
+  }
+```
+
+```{r}
+cell_id_codes <- seurat_int[[]] %>%
+  as_tibble(rownames = "cell_ids") %>%
+  mutate(id_code = str_extract(cell_ids, "_\\d.*$")) %>%
+  dplyr::select(id_code, orig.ident) %>%
+  distinct()
+
+cell_id_codes 
+```
+
+Rename the cell IDs in the `SingleCellExperiment` objects to harmonize with the cell IDs in the seurat integrated object
+```{r}
+alevin_sce <- imap(alevin_sce, function(sce, sce_name) {
+  cell_id_suffix <- cell_id_codes %>%
+    filter(orig.ident == sce_name) %>%
+    pull(id_code)
+  colnames(sce) <-
+    str_c(colnames(sce),
+          cell_id_suffix,
+          sep = "")
+  sce
+}) %>%
+  purrr::reduce(cbind) # merge the SCE objects
+```
+
+Change the gene names to match the gene ID (symbols) in the integrated Seurat object.
+```{r}
+ens_ids <- ens_ids[names(ens_ids) %in% rownames(alevin_sce)]
+alevin_sce <- alevin_sce[names(ens_ids),]
+```
+
+
+```{r}
+rownames(alevin_sce) <- ens_ids[rownames(alevin_sce)]
+```
+
+The integrated Seurat object needs to be filtered to only contain genes for which splicing information is available, i.e. counts are present in the `SingleCellExperiment` object and the conversion between the Ensembl ID and the gene symbol is possible
+
+```{r}
+alevin_sce
+```
+
+Subset the integrated Seurat object using the features detected for spliced/unspliced counts with [Alevin](https://salmon.readthedocs.io/en/latest/alevin.html).
+
+```{r}
+seurat_scVelo <-
+  subset(seurat_int, features = rownames(alevin_sce))
+seurat_scVelo
+```
+
+Note that the number of identified cells  is smaller in the alevin `SingleCellExperiment` object. We therefore subset the seurat object to only contain those cells for which splied/unspliced counts are available.
+```{r}
+seurat_scVelo <-
+  subset(seurat_scVelo, cells = WhichCells(seurat_scVelo, colnames(alevin_sce)))
+```
+
+```{r}
+alevin_sce <- alevin_sce[, Cells(seurat_scVelo)]
+```
+
+
+Extract the spliced and unspliced count matrices from the alevin-derived `SingleCellExperiment` object.
+
+```{r}
+seurat_scVelo[["spliced"]] <-
+  Seurat::CreateAssayObject(counts = assay(alevin_sce, "spliced"))
+
+seurat_scVelo[["unspliced"]] <-
+  Seurat::CreateAssayObject(counts = assay(alevin_sce, "unspliced"))
+
+seurat_scVelo
+```
+
+Ensure that the column names in the metadata do not contain "." as that interferes with python coding.
+```{r}
+colnames(seurat_scVelo@meta.data) <- str_replace_all(colnames(seurat_scVelo@meta.data), "\\.", "_")
+```
+
+
+Save the seurat object in a format readable with python.
+
+```{r}
+DefaultAssay(seurat_scVelo) <- "RNA"
+seurat_scVelo <-
+  UpdateSeuratObject(seurat_scVelo) # as the Seurat object was older than version 3.1.2
+SaveH5Seurat(
+  seurat_scVelo,
+  filename = str_c(output, "Seurat_integrated_for_scVelo.h5Seurat", sep = "/")
+)
+Convert(str_c(output, "Seurat_integrated_for_scVelo.h5Seurat",
+              sep = "/"),
+        dest = "h5ad")
+```
+
+
+
+

@@ -1,0 +1,46 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: Run scCATCH on CAMP
+output:
+  html_document:
+    df_print: paged
+---
+
+The following allows to render the `3-3.RNA_velocity_integration_with_Seurat.Rmd` on HPC nodes.
+
+```{r}
+RMD_file_name <- "3-4.seurat_to_h5ad"
+```
+
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+```
+
+```{r}
+base_dir <- "."
+```
+
+```{r}
+slurm_cmd <-
+    str_c(
+      "sbatch --cpus-per-task=8 --mem=128G -N 1 --time=16:00:00  --output=",
+      base_dir,
+      "R-analysis/Run_3-4.seurat_to_h5ad.log ",
+      base_dir,
+      "scripts/Run_3-4.seurat_to_h5ad.sh ",
+      sep = ""
+    )
+```
+
+```{r}
+slurm_cmd
+```
+
+```{r eval=TRUE, include=TRUE}
+system(slurm_cmd)
+```

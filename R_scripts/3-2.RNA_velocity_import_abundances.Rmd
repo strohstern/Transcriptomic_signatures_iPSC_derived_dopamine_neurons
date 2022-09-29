@@ -1,0 +1,163 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+author: "Stephanie Strohbuecker"
+subtitle: RNA velocity estimation with scVelo - import Alevin quanifications
+output:
+  html_document:
+    df_print: paged
+---
+
+The scVelo environment contains R4.0.3 as some of the packagges required in R are only available with the most recent Bioconductor release. (use the following conda environment: `scvelo-0.2.2`)
+```{bash, eval=False}
+module purge
+module load Anaconda3/2020.02
+conda activate scvelo-0.2.2
+
+cd projects/gandhis/sonia.gandhi/SC20054_Transcriptomic_signatures_iPSC_derived_dopamine_neurons/R-analysis/
+
+R
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+```{r}
+RMD_file_name <- "6-3.RNA_velocity_import_abundances"
+```
+
+In the following we follow the tutorial for [Alevin Velocity](https://combine-lab.github.io/alevin-tutorial/2020/alevin-velocity/):
+
+This script contains 
+
+* Step 4: Import abundances into R with tximeta
+
+# Libraries
+```{r}
+library(tidyverse)
+library(here)
+
+library(Biostrings)
+library(BSgenome)
+library(eisaR)
+library(GenomicFeatures)
+library(SummarizedExperiment)
+library(tximeta)
+library(SingleCellExperiment)
+library(rjson)
+library(reticulate)
+library(scater)
+```
+
+The `tximeta` can be used to import alevin quantifications and generate a `SummarizedExperiment` object.
+
+```{r}
+linked_anno <-
+  here("input_data",
+  "genome_info",
+  "Homo_sapiens.GRCh38.95.annotation.expanded.json")
+  
+cg_anno_path <-
+  here(
+    "input_data",
+    "genome_info",
+    "Homo_sapiens.GRCh38.95.annotation.expanded.features.tsv"
+  )
+
+alevin_quantifications <-
+  here("input_data", "alevin_quantification")
+
+# Obtain the metadata information for each of the samples
+meta_data <-
+  openxlsx::read.xlsx(here("input_data",
+                           "SC20054.xlsx"),
+                      startRow = 2,
+                      colNames = TRUE) %>%
+  dplyr::select(
+    sample_id = Sample.limsid,
+    sample_name = Sample.Name,
+    # condition = Sample.Treatment,
+    organism = Reference.Genome,
+    pred_nb_cells_captured = Predicted.Nb.of.Cells.Captured
+  ) %>%
+  dplyr::slice(1:3)
+
+# Path to output and figures directories
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if (!dir.exists(figures_out)) {
+  dir.create(figures_out, recursive = TRUE)
+}
+```
+
+Specify the sample names and file locations for input into `tximeta`
+```{r}
+files_info <- meta_data %>% 
+  mutate(alevin_files = str_c(alevin_quantifications, sample_id, "alevin/quants_mat.gz", sep = "/")) %>% 
+  dplyr::select(names = sample_id, files = alevin_files)
+```
+Load the linked transcriptome generated in script `6-1.RNA_velocity_generate_index.Rmd`.
+```{r}
+tximeta::loadLinkedTxome(linked_anno)
+```
+
+Load the data frame linking spliced and unspliced gene identifiers required as input into `tximeta::splitSE()`.
+```{r}
+cg_anno <- read.delim(cg_anno_path, header = TRUE, as.is = TRUE)
+## Rename the 'intron' column 'unspliced' to make assay names compatible with scVelo
+colnames(cg_anno)[colnames(cg_anno) == "intron"] <- "unspliced"
+```
+
+
+Before running the tximeta code to load the alevin quanitifications we need to change the default cache location for `AnnotationHub`.
+```{r}
+AnnotationHub::setAnnotationHubOption("CACHE", here("input_data", "genome_info", "AnnotationHub"))
+```
+
+Load the alevin quantifications. Note that alevin currently only supports one sample. 
+The `txi` object contains a single assay (‘counts’) containing both spliced and unspliced abundances. We use the `splitSE` function to split this into two matrices, one with spliced and one with unspliced counts.
+After having generated the required information the `SummarizedExperiment` is converted into a `SingleCellExperiment`.
+```{r}
+txi_anno <- map(files_info$names,
+                 ~ {
+                   sample_info_df <- files_info %>%
+                     filter(names == .x)
+                   txi <-
+                     tximeta::tximeta(coldata = sample_info_df,
+                                      type = "alevin",
+                                      skipMeta = TRUE)
+                   txi <- tximeta::splitSE(txi, cg_anno, assayName = "counts")
+                   txi <- as(txi, "SingleCellExperiment")
+                   assays(txi) <- list(
+                     counts = assay(txi, "spliced"),
+                     spliced = assay(txi, "spliced"),
+                     unspliced = assay(txi, "unspliced")
+                   )
+                   txi
+                 }) %>%
+  set_names(files_info$names)
+```
+
+```{r}
+write_rds(
+  txi_anno,
+  str_c(output, "sce_objects_for_scVelo_unfiltered.RDS", sep = "/"),
+  compress = "gz"
+)
+```
+
+
+
+
+
+
+
