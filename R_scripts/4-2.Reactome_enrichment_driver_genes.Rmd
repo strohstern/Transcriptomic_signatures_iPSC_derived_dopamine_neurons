@@ -1,0 +1,132 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+subtitle: "Reactome Enrichment of scVelo driver genes"
+author: Stephanie Strohbuecker
+output: 
+  html_document:
+    df_print: paged
+---
+
+# Set up
+
+```{r}
+RMD_file_name <- "4-2.Reactome_enrichment_driver_genes"
+```
+
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(here)
+
+library(AnnotationDbi)
+
+library(clusterProfiler)
+library(ReactomePA)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+# Specify the location of input and output
+driver_genes <-
+  readxl::read_excel(
+    here(
+      "output",
+      "3-5.RNA_velocity_scVelo_python",
+      "scVelo_driver_genes_for_each_cluster_top100.xlsx"
+    )
+  ) %>% 
+  dplyr::select(-'...1')
+
+# Path to output directory
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if(!dir.exists(output)){
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if(!dir.exists(figures_out)){
+  dir.create(figures_out, recursive = TRUE)
+}
+
+```
+
+
+
+## Variable assignment
+```{r}
+p_val_cut_off <- 0.05
+org <- "org.Hs.eg.db"
+```
+
+
+```{r}
+library(org, character.only=TRUE)
+```
+
+```{r}
+driver_genes <- map(driver_genes, ~.x)
+```
+
+```{r}
+driver_genes <- map(driver_genes, ~bitr(.x, fromType="SYMBOL", toType="ENTREZID", OrgDb=org))
+```
+
+
+# Enrichment of Reactome pathways among the differentially expressed genes
+
+One can investigate the enrichment of pathways among the differentially expressed genes similar to a GO enrichment analysis. Different pathway databases are available, including [KEGG pathway](https://www.genome.jp/kegg/pathway.html) and [Reactome](https://reactome.org/). In the following we will investigate the enrichment of Reactome pathways.
+
+## Reactome pathway enrichment of differentially expressed genes
+```{r}
+Reactome_analysis <-
+ map_depth(driver_genes, 1, function(res) {
+    
+    # Reactome enrichment analysis with ClusterProfiler
+    Reactome_enrich <-
+      enrichPathway(res$ENTREZID,
+                    organism = "human",
+                    readable = TRUE)
+    
+    Reactome_enrich_sig_df <-
+      Reactome_enrich@result %>% filter(p.adjust < p_val_cut_off |
+                                          str_detect(p.adjust, "<"))
+        if (NROW(Reactome_enrich_sig_df) != 0) {
+      # Generate dotplot for the 10 most enriched Reactome terms
+      Reactome_dotplot <- dotplot(Reactome_enrich) +
+        ggtitle(str_c("Reactome enrichment"))
+      # Generate cnetplot
+
+            # Generate results object with all the results (inc. figures)
+      Reactome_res <- list(
+        Reactome_sig_res = Reactome_enrich_sig_df,
+        dotplot_Reactome = Reactome_dotplot,
+        Reactome_enrichment = Reactome_enrich
+      )
+    } else {
+      Reactome_res <- NULL
+    }
+    Reactome_res
+  })
+```
+
+
+```{r, fig.width=12}
+map_depth(Reactome_analysis, 1, ~.x$dotplot_Reactome)
+```
+
+
+```{r}
+saveRDS(
+  object = list(
+    "Reactome_enrichment" = Reactome_analysis
+  ),
+  file = str_c(output,
+               "Driver_genes_top100_Reactome_enrichment.RDS",
+               sep = "/")
+)
+```

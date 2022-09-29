@@ -1,0 +1,141 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+subtitle: "Gene Ontology Enrichment of driver genes"
+author: Stephanie Strohbuecker
+output: 
+  html_document:
+    df_print: paged
+---
+
+
+# Set up
+
+```{r}
+RMD_file_name <- "4-1.GO_enrichment_driver_genes"
+```
+
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(here)
+
+library(AnnotationDbi)
+
+library(clusterProfiler)
+```
+
+## File locations
+Specify the location of input and output
+```{r}
+# Specify the location of input and output
+driver_genes <-
+  readxl::read_excel(
+    here(
+      "output",
+      "3-5.RNA_velocity_scVelo_python",
+      "scVelo_driver_genes_for_each_cluster_top100.xlsx"
+    )
+  ) %>% 
+  dplyr::select(-'...1')
+
+# Path to output directory
+output <- str_c(here(), "output", RMD_file_name, sep = "/")
+
+if(!dir.exists(output)){
+  dir.create(output, recursive = TRUE)
+}
+
+figures_out <- str_c(here(), "figures", RMD_file_name, sep = "/")
+
+if(!dir.exists(figures_out)){
+  dir.create(figures_out, recursive = TRUE)
+}
+
+```
+
+## Variable assignment
+```{r}
+p_val_cut_off <- 0.05
+org <- "org.Hs.eg.db"
+# universe_all <- rownames(dds$all$pairwise_condition)
+```
+
+
+```{r}
+library(org, character.only=TRUE)
+```
+
+```{r}
+driver_genes <- map(driver_genes, ~.x)
+```
+
+```{r}
+driver_genes <-
+  map(driver_genes,
+      ~ bitr(
+        .x,
+        fromType = "SYMBOL",
+        toType = "ENTREZID",
+        OrgDb = org
+      ))
+```
+
+# GO functional enrichment analysis with ClusterProfiler
+
+
+## BP GO enrichment across all differentially expressed genes
+```{r}
+BP_GO_enr <-
+   map_depth(driver_genes, 1, function(res) {
+
+    # BP GO enrichment analysis with ClusterProfiler
+    GO_BP <- enrichGO(
+      gene = res$ENTREZID,
+      #universe = universe_all,
+      OrgDb = org,
+      keyType = "ENTREZID",
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.05,
+      readable = TRUE
+    )
+    
+    # Extract the significantly enriched BP GO terms
+    GO_BP_sig_df <-
+      GO_BP@result %>% filter(p.adjust < 0.05 |
+                                str_detect(p.adjust, "<"))
+    
+    if (NROW(GO_BP_sig_df) != 0) {
+      # Generate dotplot for the 10 most enriched BP GO terms
+      GO_BP_dotplot <- dotplot(GO_BP) +
+        ggtitle(str_c("BP GO enrichment"))
+      
+            # Generate results object with all the results (inc. figures)
+      GO_res <- list(
+        BP_GO_sig_res = GO_BP_sig_df,
+        dotplot_GO_BP = GO_BP_dotplot,
+        GO_BP_enrichment = GO_BP
+      )
+    } else {
+      GO_res <- NULL
+    }
+    GO_res
+  })
+```
+
+```{r}
+# BP_GO_enr$NF14.1h_vs_NF14.0h$GO_BP_enrichment
+map_depth(BP_GO_enr, 1, ~ .x$dotplot_GO_BP)
+```
+
+```{r}
+saveRDS(
+  object = list("BP_GO_enrichment" = BP_GO_enr),
+  file = str_c(output,
+               "Driver_genes_top100_BPGO_enrichment.RDS",
+               sep = "/")
+)
+```
