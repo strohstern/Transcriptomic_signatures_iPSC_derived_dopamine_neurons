@@ -1,0 +1,53 @@
+---
+title: "SC20054 - Transcriptomic signatures of iPSC-derived dopamine neurons"
+subtitle: "Notes on analysis pipeline (bash commands)"
+author: Stephanie Strohbuecker
+output: 
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(tidyverse)
+library(here)
+```
+
+Folder containing the fastq files:
+`~/primary_data/`
+
+```{r}
+(
+  sample_info <-
+    openxlsx::read.xlsx(
+      here("input_data", "SC20054.xlsx"),
+      startRow = 2,
+      colNames = TRUE
+    ) %>%
+    select(
+      sample = Sample.limsid,
+      sample_name = Sample.Name,
+      pred_nb_cells_captured = Predicted.Nb.of.Cells.Captured,
+      Reference.Genome
+    ) %>%
+    mutate(Reference.Genome = str_replace(Reference.Genome, " ", "_")) %>%
+    filter(pred_nb_cells_captured != 0) # remove samples which were not sequenced
+)
+```
+
+
+```{r}
+map(sample_info$sample, function(sample_nam){
+  # note adding --test-only will only test the command with SLURM
+  slurm_cmd <-
+    str_c(
+      "sbatch -c 32 --time=24:00:00  --output=~/data/",
+      sample_nam,
+      ".log ~/scripts/cell_ranger_run.sh ", 
+      sample_nam, " ",
+      sample_info %>% filter(sample == sample_nam) %>% pull(Reference.Genome),
+      sep = ""
+    )
+  system(slurm_cmd)
+  slurm_cmd
+})
+```
