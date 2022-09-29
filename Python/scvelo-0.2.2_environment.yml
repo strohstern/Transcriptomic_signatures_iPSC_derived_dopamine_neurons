@@ -1,0 +1,41 @@
+name: scvelo-0.2.2
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - scvelo
+  - notebook
+  - r-essentials
+  - r-rjson
+  - r-reticulate
+  - bioconductor-tximeta
+  - bioconductor-eisar
+  - salmon
+  - bioconductor-biostrings
+  - bioconductor-singlecellexperiment
+  - bioconductor-biocgenerics
+  - bioconductor-bsgenome
+  - bioconductor-summarizedexperiment
+  - bioconductor-scater
+  - bioconductor-genomicfeatures
+  - r-here
+  - boost
+  - r-openxlsx
+  - bioconductor-fishpond
+  - bioconductor-tximportdata
+  - r-devtools
+  - bioconductor-velociraptor
+  - bioconductor-scran
+  - r-velocyto.r
+  - jupyterlab
+  - bioconductor-org.hs.eg.db
+  - openpyxl
+  - leidenalg
+  - cellrank-krylov
+  - r-seuratobject
+  - nodejs
+  - r-ggpubr
+  - r-clustree
+  - r-renv
+  - ipykernel
